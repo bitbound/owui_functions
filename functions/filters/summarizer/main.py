@@ -106,6 +106,31 @@ class Filter:
             print(f"[{time.strftime('%H:%M:%S')}] {message}")
             print("=============================\n")
 
+    def _safe_get_text_content(self, msg: Dict[str, Any]) -> str:
+        """Safely extract text content from a message, handling list-based formats."""
+        raw_content = msg.get("content", "")
+        
+        # If it's already a string, just return it
+        if isinstance(raw_content, str):
+            return raw_content
+        
+        # If it's a list, flatten only text-type items
+        if isinstance(raw_content, list):
+            parts = []
+            for item in raw_content:
+                if isinstance(item, dict):
+                    # Only extract text from text-type items
+                    if item.get("type") == "text":
+                        parts.append(item.get("text", ""))
+                    # Skip other types like image_url, audio, etc.
+                else:
+                    # Fallback for any unexpected non-dict item
+                    parts.append(str(item))
+            return " ".join(parts)
+        
+        # Fallback for any other unexpected type
+        return str(raw_content)
+
     def _get_summary_model(self, current_model: str) -> str:
         """Determine which model to use for summarization"""
         if self.valves.summary_model == "auto":
@@ -164,7 +189,7 @@ class Filter:
         technical_messages = 0
 
         for msg in conv_messages:
-            content = msg.get("content", "")
+            content = self._safe_get_text_content(msg)
             if len(content) >= self.valves.min_message_length:
                 total_chars += len(content)
 
@@ -216,7 +241,7 @@ class Filter:
         valid_messages = [
             m
             for m in conv_messages
-            if len(m.get("content", "")) >= self.valves.min_message_length
+            if len(self._safe_get_text_content(m)) >= self.valves.min_message_length
         ]
         avg_length = total_chars / max(len(valid_messages), 1)
 
@@ -232,7 +257,7 @@ class Filter:
         # Recent activity score (more recent = higher score)
         recent_activity = 0
         for msg in conv_messages[-5:]:  # Last 5 messages
-            if len(msg.get("content", "")) >= self.valves.min_message_length:
+            if len(self._safe_get_text_content(msg)) >= self.valves.min_message_length:
                 recent_activity += 1
         recent_activity_score = min(recent_activity / 3, 1.0)
 
@@ -310,7 +335,8 @@ class Filter:
         topics = []
 
         for msg in messages:
-            content = msg.get("content", "")
+            # Use safe content extraction to handle list-based formats
+            content = self._safe_get_text_content(msg)
             role = msg.get("role", "")
 
             # Extract questions
@@ -532,7 +558,8 @@ class Filter:
         # Create a hash based on message content
         content_string = ""
         for msg in messages[-25:]:  # Use last 25 messages for key
-            content_string += f"{msg.get('role', '')}:{msg.get('content', '')[:150]}"
+            content = self._safe_get_text_content(msg)
+            content_string += f"{msg.get('role', '')}:{content[:150]}"
 
         return hashlib.md5(content_string.encode()).hexdigest()[:16]
 
