@@ -13,6 +13,8 @@ from typing import Optional, List, Dict, Any
 import json
 import time
 import hashlib
+import inspect
+from uuid import uuid4
 
 
 class Filter:
@@ -563,32 +565,156 @@ class Filter:
 
         return hashlib.md5(content_string.encode()).hexdigest()[:16]
 
-    async def _create_ai_summary(
-        self, messages: List[Dict], summary_model: str, quality: str
-    ) -> Optional[str]:
-        """
-        Placeholder for future AI-based summarization using the selected model.
-        Currently returns None to fall back to enhanced rule-based summarization.
+    def _build_ai_summary_messages(
+        self, messages: List[Dict], quality: str
+    ) -> List[Dict[str, str]]:
+        """Build a compact prompt for model-based summarization."""
+        style_map = {
+            "quick": "Keep it brief and high-signal in 3-5 sentences.",
+            "balanced": "Keep it concise but complete in 1 short paragraph or 4-6 sentences.",
+            "detailed": "Keep it comprehensive in 2 short paragraphs, preserving important decisions and constraints.",
+        }
 
-        Future implementation could:
-        1. Make API call to the specified summary_model
-        2. Use different prompts based on quality setting
-        3. Handle model-specific optimizations
-        """
-        # TODO: Implement actual AI-based summarization
-        # This would require making API calls to Open WebUI's chat completion endpoint
-        # with the specified model and a summarization prompt
+        conversation_lines = []
+        for msg in messages:
+            content = self._safe_get_text_content(msg).strip()
+            if not content:
+                continue
+            role = msg.get("role", "assistant").upper()
+            conversation_lines.append(f"{role}: {content}")
 
-        self._debug_log(
-            f"AI summarization not yet implemented for model: {summary_model}"
-        )
+        transcript = "\n\n".join(conversation_lines)
+
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You summarize prior chat context for continuation. "
+                    "Return plain text only. Do not use markdown, bullet lists, or speaker labels unless necessary. "
+                    "Preserve user goals, constraints, decisions, unresolved questions, and important factual details. "
+                    f"{style_map.get(quality, style_map['balanced'])}"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Summarize this earlier conversation so a model can continue it naturally. "
+                    "Focus on requests, answers, decisions, technical details, and any open work.\n\n"
+                    f"Conversation:\n{transcript}"
+                ),
+            },
+        ]
+
+    def _extract_ai_summary_text(self, response: Any) -> Optional[str]:
+        """Extract summary text from an OpenAI-style chat completion response."""
+        if not isinstance(response, dict):
+            return None
+
+        choices = response.get("choices") or []
+        if not choices:
+            return None
+
+        message = choices[0].get("message") or {}
+        content = message.get("content", "")
+
+        if isinstance(content, str):
+            return content.strip() or None
+
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text = item.get("text", "").strip()
+                    if text:
+                        parts.append(text)
+                elif isinstance(item, str):
+                    text = item.strip()
+                    if text:
+                        parts.append(text)
+
+            joined = " ".join(parts).strip()
+            return joined or None
+
         return None
 
+    async def _create_ai_summary(
+        self,
+        messages: List[Dict],
+        summary_model: str,
+        quality: str,
+        __request__,
+        __user__: Optional[dict] = None,
+    ) -> Optional[str]:
+        """Generate a summary through Open WebUI's internal chat completion path."""
+        if not __request__ or not __user__ or not __user__.get("id"):
+            self._debug_log("AI summarization skipped: missing request or user context")
+            return None
+
+        prompt_messages = self._build_ai_summary_messages(messages, quality)
+        if len(prompt_messages) < 2:
+            return None
+
+        try:
+            from open_webui.main import generate_chat_completion
+            from open_webui.models.users import Users
+        except Exception as exc:
+            self._debug_log(f"AI summarization unavailable: {exc}")
+            return None
+
+        user = await Users.get_user_by_id(__user__["id"])
+        if not user:
+            self._debug_log(
+                f"AI summarization skipped: could not load user {__user__['id']}"
+            )
+            return None
+
+        payload = {
+            "model": summary_model,
+            "messages": prompt_messages,
+            "stream": False,
+            "chat_id": f"local:summarizer:{uuid4().hex}",
+            "id": f"summarizer-{uuid4().hex}",
+        }
+
+        self._debug_log(
+            f"Attempting AI summarization with model {summary_model} for {len(messages)} messages"
+        )
+
+        generate_signature = inspect.signature(generate_chat_completion)
+        if "bypass_filter" in generate_signature.parameters:
+            response = await generate_chat_completion(
+                __request__, payload, user, bypass_filter=True
+            )
+        else:
+            self._debug_log(
+                "AI summarization using legacy chat completion signature without bypass_filter"
+            )
+            response = await generate_chat_completion(__request__, payload, user)
+
+        summary = self._extract_ai_summary_text(response)
+
+        if summary:
+            self._debug_log(
+                f"AI summarization succeeded ({len(summary)} chars)"
+            )
+        else:
+            self._debug_log("AI summarization returned no usable text")
+
+        return summary
+
     async def inlet(
-        self, body: dict, __event_emitter__, __user__: Optional[dict] = None
+        self,
+        body: dict,
+        __event_emitter__,
+        __user__: Optional[dict] = None,
+        __request__=None,
     ) -> dict:
 
         self._debug_log("=== INLET CALLED ===")
+
+        if str(body.get("chat_id", "")).startswith("local:summarizer:"):
+            self._debug_log("Skipping summarizer for internal AI summary request")
+            return body
 
         if not self.toggle:
             self._debug_log("Filter disabled via toggle")
@@ -690,8 +816,10 @@ class Filter:
                     )
 
                     # Create enhanced summary
+                    summary_source = "rule-based"
                     if cached_summary:
                         summary_text = cached_summary
+                        summary_source = "cached"
                         self._debug_log(f"Using cached summary")
                     else:
                         # Try AI summarization if enabled
@@ -702,8 +830,11 @@ class Filter:
                                     messages_to_summarize,
                                     summary_model,
                                     self.valves.summary_quality,
+                                    __request__,
+                                    __user__,
                                 )
                                 if summary_text:
+                                    summary_source = "ai"
                                     self._debug_log(
                                         f"Generated AI summary using {summary_model}"
                                     )
@@ -717,6 +848,7 @@ class Filter:
                             summary_text = self._create_enhanced_summary(
                                 messages_to_summarize, self.valves.summary_quality
                             )
+                            summary_source = "rule-based"
                             self._debug_log(
                                 f"Generated enhanced rule-based {self.valves.summary_quality} summary"
                             )
@@ -778,9 +910,12 @@ class Filter:
                     self._debug_log(f"Performance stats: {self.performance_stats}")
 
                     # Create status message with model info
-                    status_msg = f"✅ Enhanced summary created using {model_display}! {len(messages)} → {len(new_messages)} messages"
-                    if cached_summary:
-                        status_msg += " (cached)"
+                    source_label = {
+                        "ai": "AI",
+                        "cached": "cached",
+                        "rule-based": "rule-based",
+                    }[summary_source]
+                    status_msg = f"✅ {source_label.capitalize()} summary created using {model_display}! {len(messages)} → {len(new_messages)} messages"
 
                     await __event_emitter__(
                         {
