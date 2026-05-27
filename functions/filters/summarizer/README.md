@@ -67,8 +67,10 @@
 ### 2️⃣ Basic Configuration
 ```yaml
 # Recommended starting settings
-summary_trigger_turns: 8        # Trigger after 8 conversation turns
-preserve_recent_turns: 4        # Keep last 4 turns unsummarized  
+max_context_tokens: 32768       # Model context window estimate
+summary_trigger_percent: 70     # Compact at 70% estimated usage
+summary_target_percent: 45      # Compact down to about 45% usage
+preserve_recent_turns: 4        # Keep at least 4 recent turns unsummarized
 summary_quality: "balanced"     # Use balanced quality mode
 summary_model: "auto"          # Use current conversation model
 enable_ai_summarization: true   # Enable model-based summarization
@@ -83,7 +85,7 @@ enable_debug: true             # Enable debugging initially
 
 ### 4️⃣ Monitor & Optimize
 - Review debug logs to understand trigger patterns
-- Adjust `summary_trigger_turns` based on your needs
+- Adjust context trigger/target percentages based on your model size
 - Experiment with different `summary_quality` modes
 - Fine-tune `adaptive_threshold` settings
 
@@ -187,8 +189,12 @@ summary_model: "gpt-3.5-turbo"    # Use cloud model for summarization
 #### 🎛️ Essential Configuration
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `summary_trigger_turns` | `8` | Number of conversation turns that triggers summarization |
-| `preserve_recent_turns` | `4` | Number of recent turns to keep unsummarized |
+| `summary_trigger_turns` | `8` | Fallback minimum turns before summarization can occur |
+| `preserve_recent_turns` | `4` | Minimum number of recent turns to keep unsummarized |
+| `max_context_tokens` | `32768` | Estimated model context window size |
+| `summary_trigger_percent` | `70` | Trigger compaction at this estimated context usage |
+| `summary_target_percent` | `45` | Target this estimated context usage after compaction |
+| `estimated_chars_per_token` | `4.0` | Approximation factor for context estimation |
 | `summary_model` | `"auto"` | Model for summarization (`"auto"` or specific model name) |
 | `summary_quality` | `"balanced"` | Summary quality: `"quick"`, `"balanced"`, or `"detailed"` |
 | `priority` | `0` | Filter execution priority (lower = higher priority) |
@@ -211,6 +217,9 @@ enable_ai_summarization: false         # Use model-based summarization with rule
 summary_api_base_url: ""               # Optional Open WebUI base URL override for self-calls
 summary_api_key: ""                    # Optional API key override for self-calls
 summary_api_timeout_seconds: 60        # Timeout for /api/chat/completions self-calls
+summary_max_chars_quick: 250           # Hard cap for quick summaries
+summary_max_chars_balanced: 500        # Hard cap for balanced summaries
+summary_max_chars_detailed: 800        # Hard cap for detailed summaries
 ```
 
 #### 🔧 Testing & Debug

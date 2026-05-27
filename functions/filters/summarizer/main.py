@@ -23,10 +23,27 @@ class Filter:
         # Core functionality
         summary_trigger_turns: int = Field(
             default=8,
-            description="Number of conversation turns that triggers summarization",
+            description="Fallback minimum number of conversation turns before summarization can occur",
         )
         preserve_recent_turns: int = Field(
-            default=4, description="Number of recent turns to keep unsummarized"
+            default=4,
+            description="Minimum number of recent turns to keep unsummarized during compaction",
+        )
+        max_context_tokens: int = Field(
+            default=32768,
+            description="Estimated maximum context window size for the active model",
+        )
+        summary_trigger_percent: int = Field(
+            default=70,
+            description="Trigger compaction when estimated context usage reaches this percentage",
+        )
+        summary_target_percent: int = Field(
+            default=45,
+            description="After compaction, target this percentage of estimated context usage",
+        )
+        estimated_chars_per_token: float = Field(
+            default=4.0,
+            description="Approximate characters per token used for context estimation",
         )
 
         # Model and processing control
@@ -86,6 +103,18 @@ class Filter:
         )
         include_context_hints: bool = Field(
             default=True, description="Add helpful context hints to summaries"
+        )
+        summary_max_chars_quick: int = Field(
+            default=250,
+            description="Maximum number of characters allowed in quick summaries",
+        )
+        summary_max_chars_balanced: int = Field(
+            default=500,
+            description="Maximum number of characters allowed in balanced summaries",
+        )
+        summary_max_chars_detailed: int = Field(
+            default=800,
+            description="Maximum number of characters allowed in detailed summaries",
         )
 
         # Debug and testing
@@ -164,6 +193,62 @@ class Filter:
                 f"Using same model for conversation and summarization: {current_model}"
             )
 
+    def _estimate_text_tokens(self, text: str) -> int:
+        """Estimate token count from text using a configurable chars/token ratio."""
+        if not text:
+            return 0
+
+        chars_per_token = max(self.valves.estimated_chars_per_token, 1.0)
+        return max(1, int(len(text) / chars_per_token) + 1)
+
+    def _estimate_message_tokens(self, msg: Dict[str, Any]) -> int:
+        """Estimate token count for a single message including a small role overhead."""
+        content = self._safe_get_text_content(msg)
+        role = msg.get("role", "")
+        return self._estimate_text_tokens(content) + self._estimate_text_tokens(role) + 4
+
+    def _estimate_messages_tokens(self, messages: List[Dict]) -> int:
+        """Estimate total token count across messages."""
+        return sum(self._estimate_message_tokens(msg) for msg in messages)
+
+    def _get_context_thresholds(self) -> Dict[str, int]:
+        """Return estimated trigger and target token budgets."""
+        max_tokens = max(self.valves.max_context_tokens, 1)
+        trigger_percent = min(max(self.valves.summary_trigger_percent, 1), 100)
+        target_percent = min(max(self.valves.summary_target_percent, 1), trigger_percent)
+
+        return {
+            "max_tokens": max_tokens,
+            "trigger_tokens": max(1, int(max_tokens * (trigger_percent / 100))),
+            "target_tokens": max(1, int(max_tokens * (target_percent / 100))),
+        }
+
+    def _get_summary_char_limit(self, quality: str) -> int:
+        """Return the configured max summary length for a quality mode."""
+        return {
+            "quick": self.valves.summary_max_chars_quick,
+            "balanced": self.valves.summary_max_chars_balanced,
+            "detailed": self.valves.summary_max_chars_detailed,
+        }.get(quality, self.valves.summary_max_chars_balanced)
+
+    def _enforce_summary_length(self, summary: str, quality: str) -> str:
+        """Trim a summary to its configured length budget."""
+        max_length = max(self._get_summary_char_limit(quality), 32)
+        if len(summary) > max_length:
+            summary = summary[: max_length - 3] + "..."
+        return summary
+
+    def _get_conversation_id(
+        self, body: Dict[str, Any], __user__: Optional[dict], model: str
+    ) -> str:
+        """Build a stable conversation identifier for summary tracking."""
+        chat_id = body.get("chat_id") or body.get("id")
+        if chat_id:
+            return str(chat_id)
+
+        user_id = (__user__ or {}).get("id", "anon")
+        return f"fallback:{user_id}:{model}"
+
     def _analyze_conversation_state(self, messages: List[Dict]) -> Dict[str, Any]:
         """Enhanced conversation analysis with smart detection"""
 
@@ -180,6 +265,7 @@ class Filter:
                 "complexity_score": 1.0,
                 "avg_message_length": 100,
                 "recent_activity_score": 1.0,
+                "estimated_tokens": self._estimate_messages_tokens(messages),
             }
 
         system_msgs = [m for m in messages if m.get("role") == "system"]
@@ -277,7 +363,7 @@ class Filter:
         recent_activity_score = min(recent_activity / 3, 1.0)
 
         self._debug_log(
-            f"Conversation analysis - Total: {len(conv_messages)}, Valid: {len(valid_messages)}, Summaries: {existing_summaries}, Complexity: {complexity_score:.2f}, Activity: {recent_activity_score:.2f}"
+            f"Conversation analysis - Total: {len(conv_messages)}, Valid: {len(valid_messages)}, Summaries: {existing_summaries}, Complexity: {complexity_score:.2f}, Activity: {recent_activity_score:.2f}, Est. tokens: {self._estimate_messages_tokens(messages)}"
         )
 
         return {
@@ -291,6 +377,7 @@ class Filter:
             "question_count": question_count,
             "code_messages": code_messages,
             "technical_messages": technical_messages,
+            "estimated_tokens": self._estimate_messages_tokens(messages),
         }
 
     def _should_summarize_smart(
@@ -300,19 +387,28 @@ class Filter:
 
         base_threshold = self.valves.summary_trigger_turns
         current_turns = conv_state["valid_turns"]
+        estimated_tokens = conv_state.get("estimated_tokens", 0)
+        thresholds = self._get_context_thresholds()
+        trigger_tokens = thresholds["trigger_tokens"]
 
         # Don't summarize if we just did recently
         if conversation_id in self.last_summary_turn_counts:
             turns_since_last = (
                 current_turns - self.last_summary_turn_counts[conversation_id]
             )
-            if (
-                turns_since_last < base_threshold * 0.6
-            ):  # Wait at least 60% of threshold
+            if estimated_tokens < trigger_tokens and turns_since_last < max(
+                1, int(base_threshold * 0.6)
+            ):
                 self._debug_log(
                     f"Too soon since last summary ({turns_since_last} turns ago)"
                 )
                 return False
+
+        if estimated_tokens >= trigger_tokens:
+            self._debug_log(
+                f"Context threshold reached ({estimated_tokens}/{thresholds['max_tokens']} est. tokens, trigger {trigger_tokens})"
+            )
+            return True
 
         # Don't summarize if there are existing summaries and not much new content
         if conv_state["has_existing_summary"] and current_turns < base_threshold * 1.5:
@@ -339,6 +435,60 @@ class Filter:
             return current_turns >= adjusted_threshold
         else:
             return current_turns >= base_threshold
+
+    def _split_messages_by_context_budget(
+        self, system_msgs: List[Dict], conversation_messages: List[Dict], quality: str
+    ) -> Dict[str, Any]:
+        """Split messages so the preserved tail fits within the target context budget."""
+        thresholds = self._get_context_thresholds()
+        non_summary_system_msgs = []
+        for sys_msg in system_msgs:
+            content = self._safe_get_text_content(sys_msg)
+            if (
+                "📋" not in content
+                and "Summary" not in content
+                and "Previous conversation" not in content
+            ):
+                non_summary_system_msgs.append(sys_msg)
+
+        target_tokens = thresholds["target_tokens"]
+        base_tokens = self._estimate_messages_tokens(non_summary_system_msgs)
+        summary_budget_tokens = self._estimate_text_tokens("x" * self._get_summary_char_limit(quality)) + 16
+        preserve_tokens = base_tokens + summary_budget_tokens
+
+        preserved_reversed: List[Dict] = []
+        minimum_recent = min(self.valves.preserve_recent_turns, len(conversation_messages))
+
+        for msg in reversed(conversation_messages):
+            msg_tokens = self._estimate_message_tokens(msg)
+            if len(preserved_reversed) < minimum_recent:
+                preserved_reversed.append(msg)
+                preserve_tokens += msg_tokens
+                continue
+
+            if preserve_tokens + msg_tokens <= target_tokens:
+                preserved_reversed.append(msg)
+                preserve_tokens += msg_tokens
+                continue
+
+            break
+
+        messages_to_preserve = list(reversed(preserved_reversed))
+        preserve_count = len(messages_to_preserve)
+        messages_to_summarize = conversation_messages[: len(conversation_messages) - preserve_count]
+
+        if not messages_to_summarize and len(conversation_messages) > minimum_recent:
+            preserve_count = max(minimum_recent, len(conversation_messages) - 1)
+            messages_to_preserve = conversation_messages[-preserve_count:]
+            messages_to_summarize = conversation_messages[:-preserve_count]
+
+        return {
+            "messages_to_summarize": messages_to_summarize,
+            "messages_to_preserve": messages_to_preserve,
+            "target_tokens": target_tokens,
+            "trigger_tokens": thresholds["trigger_tokens"],
+            "estimated_preserved_tokens": preserve_tokens,
+        }
 
     def _extract_key_information(self, messages: List[Dict]) -> Dict[str, List[str]]:
         """Extract key information from messages for enhanced summarization"""
@@ -554,10 +704,7 @@ class Filter:
             if self.valves.include_context_hints:
                 summary += f". Context preserved for natural continuation."
 
-        # Ensure reasonable length
-        max_length = {"quick": 250, "balanced": 500, "detailed": 800}[quality]
-        if len(summary) > max_length:
-            summary = summary[: max_length - 3] + "..."
+        summary = self._enforce_summary_length(summary, quality)
 
         self._debug_log(
             f"Generated {quality} summary ({len(summary)} chars): {summary[:100]}..."
@@ -581,6 +728,48 @@ class Filter:
             content_string += f"{msg.get('role', '')}:{content[:150]}"
 
         return hashlib.md5(content_string.encode()).hexdigest()[:16]
+
+    def _extract_existing_summary_text(self, messages: List[Dict]) -> str:
+        """Extract previously generated summary text from system messages."""
+        for msg in reversed(messages):
+            if msg.get("role") != "system":
+                continue
+
+            content = self._safe_get_text_content(msg)
+            if "📋 **Conversation Summary**" not in content:
+                continue
+
+            summary_text = content
+            if "):\n\n" in summary_text:
+                summary_text = summary_text.split("):\n\n", 1)[1]
+            if "\n\n---\n*Recent messages continue below*" in summary_text:
+                summary_text = summary_text.split(
+                    "\n\n---\n*Recent messages continue below*", 1
+                )[0]
+
+            return summary_text.strip()
+
+        return ""
+
+    def _build_summary_input_messages(
+        self, existing_summary_text: str, messages_to_summarize: List[Dict]
+    ) -> List[Dict]:
+        """Create the input slice for cumulative summarization."""
+        summary_input_messages: List[Dict] = []
+
+        if existing_summary_text:
+            summary_input_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Previous conversation summary to roll forward:\n\n"
+                        f"{existing_summary_text}"
+                    ),
+                }
+            )
+
+        summary_input_messages.extend(messages_to_summarize)
+        return summary_input_messages
 
     def _get_summary_api_url(self, __request__) -> Optional[str]:
         """Resolve the self-call chat completions URL."""
@@ -680,6 +869,7 @@ class Filter:
 
         summary = self._extract_ai_summary_text(response_data)
         if summary:
+            summary = self._enforce_summary_length(summary, quality)
             self._debug_log(f"AI summarization via HTTP succeeded ({len(summary)} chars)")
         else:
             self._debug_log("AI summarization HTTP path returned no usable text")
@@ -823,6 +1013,7 @@ class Filter:
         summary = self._extract_ai_summary_text(response)
 
         if summary:
+            summary = self._enforce_summary_length(summary, quality)
             self._debug_log(
                 f"AI summarization succeeded ({len(summary)} chars)"
             )
@@ -879,7 +1070,7 @@ class Filter:
 
             # Enhanced conversation analysis
             conv_state = self._analyze_conversation_state(messages)
-            conversation_id = f"conv_{len(messages)}_{int(time.time()/100)}"  # Group by ~100 second windows
+            conversation_id = self._get_conversation_id(body, __user__, model)
 
             self._debug_log(f"Enhanced analysis: {conv_state}")
 
@@ -914,7 +1105,7 @@ class Filter:
                     {
                         "type": "status",
                         "data": {
-                            "description": f"📝 Creating {self.valves.summary_quality} summary using {model_display} ({conv_state['valid_turns']} turns → summary + {self.valves.preserve_recent_turns} recent)",
+                            "description": f"📝 Creating {self.valves.summary_quality} summary using {model_display} ({conv_state['estimated_tokens']} est. tokens, target {self._get_context_thresholds()['target_tokens']})",
                             "done": False,
                             "hidden": False,
                         },
@@ -927,15 +1118,20 @@ class Filter:
                     m for m in messages if m.get("role") in ["user", "assistant"]
                 ]
 
-                if len(conversation_messages) > self.valves.preserve_recent_turns:
+                split_result = self._split_messages_by_context_budget(
+                    system_msgs, conversation_messages, self.valves.summary_quality
+                )
+                messages_to_summarize = split_result["messages_to_summarize"]
+                messages_to_preserve = split_result["messages_to_preserve"]
 
-                    # Split conversation
-                    messages_to_summarize = conversation_messages[
-                        : -self.valves.preserve_recent_turns
-                    ]
-                    messages_to_preserve = conversation_messages[
-                        -self.valves.preserve_recent_turns :
-                    ]
+                if messages_to_summarize:
+
+                    existing_summary_text = self._extract_existing_summary_text(
+                        system_msgs
+                    )
+                    summary_input_messages = self._build_summary_input_messages(
+                        existing_summary_text, messages_to_summarize
+                    )
 
                     self._debug_log(
                         f"Summarizing {len(messages_to_summarize)} messages"
@@ -943,6 +1139,13 @@ class Filter:
                     self._debug_log(
                         f"Preserving {len(messages_to_preserve)} recent messages"
                     )
+                    self._debug_log(
+                        f"Context budget - current {conv_state['estimated_tokens']} est. tokens, trigger {split_result['trigger_tokens']}, target {split_result['target_tokens']}, preserved ~{split_result['estimated_preserved_tokens']}"
+                    )
+                    if existing_summary_text:
+                        self._debug_log(
+                            f"Rolling forward existing summary ({len(existing_summary_text)} chars)"
+                        )
 
                     # Create enhanced summary
                     summary_source = "rule-based"
@@ -956,7 +1159,7 @@ class Filter:
                         if self.valves.enable_ai_summarization:
                             try:
                                 summary_text = await self._create_ai_summary(
-                                    messages_to_summarize,
+                                    summary_input_messages,
                                     summary_model,
                                     self.valves.summary_quality,
                                     __request__,
@@ -975,7 +1178,7 @@ class Filter:
                         # Fall back to enhanced rule-based summarization
                         if not summary_text:
                             summary_text = self._create_enhanced_summary(
-                                messages_to_summarize, self.valves.summary_quality
+                                summary_input_messages, self.valves.summary_quality
                             )
                             summary_source = "rule-based"
                             self._debug_log(
@@ -1044,7 +1247,7 @@ class Filter:
                         "cached": "cached",
                         "rule-based": "rule-based",
                     }[summary_source]
-                    status_msg = f"✅ {source_label.capitalize()} summary created using {model_display}! {len(messages)} → {len(new_messages)} messages"
+                    status_msg = f"✅ {source_label.capitalize()} summary created using {model_display}! {conv_state['estimated_tokens']} est. tokens compacted toward {split_result['target_tokens']}"
 
                     await __event_emitter__(
                         {
