@@ -10,6 +10,7 @@ description: Full-featured conversation summarizer with model selection, priorit
 
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
+import aiohttp
 import json
 import time
 import hashlib
@@ -60,6 +61,18 @@ class Filter:
         enable_ai_summarization: bool = Field(
             default=False,
             description="Use AI model for summarization (experimental - currently uses enhanced rule-based)",
+        )
+        summary_api_base_url: str = Field(
+            default="",
+            description="Optional base URL override for AI summary self-calls (defaults to current Open WebUI request base URL)",
+        )
+        summary_api_key: str = Field(
+            default="",
+            description="Optional API key override for AI summary self-calls to /api/chat/completions",
+        )
+        summary_api_timeout_seconds: int = Field(
+            default=60,
+            description="Timeout in seconds for AI summary HTTP self-calls",
         )
 
         # Content filtering and enhancement
@@ -558,12 +571,120 @@ class Filter:
             return ""
 
         # Create a hash based on message content
-        content_string = ""
+        content_string = (
+            f"mode:{'ai' if self.valves.enable_ai_summarization else 'rule'}|"
+            f"model:{self.valves.summary_model}|"
+            f"quality:{self.valves.summary_quality}|"
+        )
         for msg in messages[-25:]:  # Use last 25 messages for key
             content = self._safe_get_text_content(msg)
             content_string += f"{msg.get('role', '')}:{content[:150]}"
 
         return hashlib.md5(content_string.encode()).hexdigest()[:16]
+
+    def _get_summary_api_url(self, __request__) -> Optional[str]:
+        """Resolve the self-call chat completions URL."""
+        base_url = (self.valves.summary_api_base_url or "").strip()
+
+        if not base_url and __request__ is not None:
+            request_base_url = getattr(__request__, "base_url", None)
+            if request_base_url:
+                base_url = str(request_base_url).strip()
+
+        if not base_url:
+            return None
+
+        return f"{base_url.rstrip('/')}/api/chat/completions"
+
+    def _build_summary_api_headers(self, __request__) -> Dict[str, str]:
+        """Build auth headers for the self-call, preferring explicit valve auth."""
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        if self.valves.summary_api_key:
+            headers["Authorization"] = f"Bearer {self.valves.summary_api_key}"
+            return headers
+
+        if __request__ is None:
+            return headers
+
+        request_headers = getattr(__request__, "headers", None)
+        if not request_headers:
+            return headers
+
+        authorization = request_headers.get("authorization") or request_headers.get(
+            "Authorization"
+        )
+        if authorization:
+            headers["Authorization"] = authorization
+
+        cookie = request_headers.get("cookie") or request_headers.get("Cookie")
+        if cookie:
+            headers["Cookie"] = cookie
+
+        return headers
+
+    async def _create_ai_summary_via_http(
+        self,
+        messages: List[Dict],
+        summary_model: str,
+        quality: str,
+        __request__,
+    ) -> Optional[str]:
+        """Generate a summary by calling Open WebUI's public chat completions API."""
+        api_url = self._get_summary_api_url(__request__)
+        if not api_url:
+            self._debug_log("AI summarization HTTP path skipped: no base URL available")
+            return None
+
+        prompt_messages = self._build_ai_summary_messages(messages, quality)
+        if len(prompt_messages) < 2:
+            return None
+
+        payload = {
+            "model": summary_model,
+            "messages": prompt_messages,
+            "stream": False,
+            "chat_id": f"local:summarizer:{uuid4().hex}",
+            "id": f"summarizer-{uuid4().hex}",
+        }
+        headers = self._build_summary_api_headers(__request__)
+
+        self._debug_log(
+            f"Attempting AI summarization via HTTP API {api_url} with model {summary_model}"
+        )
+
+        timeout = aiohttp.ClientTimeout(total=self.valves.summary_api_timeout_seconds)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.post(api_url, json=payload, headers=headers) as response:
+                    response_text = await response.text()
+                    if response.status >= 400:
+                        self._debug_log(
+                            f"AI summarization HTTP path failed ({response.status}): {response_text[:200]}"
+                        )
+                        return None
+
+                    try:
+                        response_data = json.loads(response_text)
+                    except json.JSONDecodeError:
+                        self._debug_log(
+                            "AI summarization HTTP path returned non-JSON response"
+                        )
+                        return None
+        except Exception as exc:
+            self._debug_log(f"AI summarization HTTP path error: {exc}")
+            return None
+
+        summary = self._extract_ai_summary_text(response_data)
+        if summary:
+            self._debug_log(f"AI summarization via HTTP succeeded ({len(summary)} chars)")
+        else:
+            self._debug_log("AI summarization HTTP path returned no usable text")
+
+        return summary
 
     def _build_ai_summary_messages(
         self, messages: List[Dict], quality: str
@@ -645,10 +766,18 @@ class Filter:
         __request__,
         __user__: Optional[dict] = None,
     ) -> Optional[str]:
-        """Generate a summary through Open WebUI's internal chat completion path."""
+        """Generate a summary, preferring the public chat API and falling back to internal helpers."""
         if not __request__ or not __user__ or not __user__.get("id"):
             self._debug_log("AI summarization skipped: missing request or user context")
             return None
+
+        summary = await self._create_ai_summary_via_http(
+            messages, summary_model, quality, __request__
+        )
+        if summary:
+            return summary
+
+        self._debug_log("Falling back to internal AI summarization path")
 
         prompt_messages = self._build_ai_summary_messages(messages, quality)
         if len(prompt_messages) < 2:

@@ -71,6 +71,7 @@ summary_trigger_turns: 8        # Trigger after 8 conversation turns
 preserve_recent_turns: 4        # Keep last 4 turns unsummarized  
 summary_quality: "balanced"     # Use balanced quality mode
 summary_model: "auto"          # Use current conversation model
+enable_ai_summarization: true   # Enable model-based summarization
 enable_debug: true             # Enable debugging initially
 ```
 
@@ -206,8 +207,10 @@ summary_model: "gpt-3.5-turbo"    # Use cloud model for summarization
 #### ⚡ Performance Settings
 ```yaml
 enable_caching: true                    # Cache summaries for performance
-enable_ai_summarization: false         # Future AI-based summarization (experimental)
-debug_performance: false               # Enable performance timing logs
+enable_ai_summarization: false         # Use model-based summarization with rule-based fallback
+summary_api_base_url: ""               # Optional Open WebUI base URL override for self-calls
+summary_api_key: ""                    # Optional API key override for self-calls
+summary_api_timeout_seconds: 60        # Timeout for /api/chat/completions self-calls
 ```
 
 #### 🔧 Testing & Debug
@@ -251,7 +254,7 @@ Watch for these indicators:
 ```
 🔍 Summarizer analyzing 12 messages...
 📝 Creating balanced summary using current model (10 turns → summary + 4 recent)
-✅ Enhanced summary created! 12 → 6 messages
+✅ Ai summary created using current model! 12 → 6 messages
 ```
 
 ### Testing & Debugging
