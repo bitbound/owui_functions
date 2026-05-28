@@ -10,18 +10,18 @@
 
 ## 🌟 Overview
 
-**Enhanced Conversation Summarizer** is a powerful Open WebUI filter that automatically manages long conversations by intelligently summarizing older messages while preserving recent context. Built with smart detection, model selection, and performance optimization, it ensures your conversations remain focused and within context limits without losing important information.
+**Enhanced Conversation Summarizer** is an Open WebUI filter that automatically compacts older conversation history while preserving a recent tail for continuity. It prefers exact provider-side `/tokenize` preflight to decide when to summarize and only falls back to a flat turn threshold when exact tokenization is unavailable.
 
 ### ✨ Key Features
 
-- 🧠 **Smart Conversation Analysis** - Intelligent detection of conversation complexity, technical content, and context
+- 🎯 **Exact Token Triggering** - Uses provider-side `/tokenize` counts when available
 - 🎛️ **Model Selection** - Choose specific models for summarization or use current conversation model
-- ⚡ **Performance Optimized** - Smart caching, adaptive thresholds, and efficient processing
+- ⚡ **Performance Optimized** - Smart caching and targeted compaction planning
 - 🎯 **Quality Modes** - Quick, Balanced, or Detailed summarization based on your needs
-- 📊 **Advanced Detection** - Mid-conversation loading awareness and existing summary recognition
-- 🔧 **Comprehensive Configuration** - 15+ customizable settings for fine-tuned control
+- 📊 **State Recovery** - Mid-conversation enablement handling and stored-summary replay
+- 🔧 **Provider-Aware Configuration** - Separate settings for summary self-calls and tokenizer preflight
 - 🐛 **Debug & Monitoring** - Extensive logging and performance statistics
-- 💾 **Reliable Operation** - Graceful error handling and fallback mechanisms
+- 💾 **Reliable Operation** - Graceful error handling plus a flat turn-count fallback
 
 ---
 
@@ -67,27 +67,27 @@
 ### 2️⃣ Basic Configuration
 ```yaml
 # Recommended starting settings
-max_context_tokens: 32768       # Model context window estimate
-summary_trigger_percent: 70     # Compact at 70% estimated usage
-summary_target_percent: 45      # Compact down to about 45% usage
-preserve_recent_turns: 4        # Keep at least 4 recent turns unsummarized
-summary_quality: "balanced"     # Use balanced quality mode
-summary_model: "auto"          # Use current conversation model
-enable_ai_summarization: true   # Enable model-based summarization
-enable_debug: true             # Enable debugging initially
+tokenizer_api_base_url: "http://your-vllm-host:8000"  # Exact /tokenize endpoint root
+summary_trigger_turns: 6                              # Flat fallback if /tokenize is unavailable
+summary_trigger_percent: 70                           # Summarize at 70% of model capacity
+summary_target_percent: 45                            # Compact to about 45% of model capacity
+preserve_recent_turns: 4                              # Keep at least 4 recent turns unsummarized
+summary_quality: "balanced"                           # Use balanced quality mode
+summary_model: "auto"                                # Use current conversation model
+enable_debug: true                                    # Enable debugging initially
 ```
 
 ### 3️⃣ Test the System
-1. Start a conversation with 8+ back-and-forth messages
-2. Watch for status messages indicating summarization
+1. Set `tokenizer_api_base_url` to your inference server root if it exposes `/tokenize`
+2. Start a conversation large enough to cross your configured token threshold, or use `force_summarize_next: true`
 3. Check console logs for detailed operation info
-4. Use `force_summarize_next: true` for manual testing
+4. Confirm status messages mention exact tokens when tokenization is available
 
 ### 4️⃣ Monitor & Optimize
-- Review debug logs to understand trigger patterns
-- Adjust context trigger/target percentages based on your model size
+- Review debug logs to confirm exact-token decisions vs fallback turn decisions
+- Adjust trigger/target percentages based on your model capacity
 - Experiment with different `summary_quality` modes
-- Fine-tune `adaptive_threshold` settings
+- Adjust `summary_trigger_turns` only as a fallback behavior
 
 ---
 
@@ -124,7 +124,7 @@ enable_debug: true             # Enable debugging initially
 
 5. **Verification**
    - Start a test conversation
-   - Send 8+ messages back and forth
+   - Send enough messages to cross your token threshold, or force one summary with `force_summarize_next: true`
    - Watch for summarization status messages
    - Check console logs for debug information
 
@@ -134,20 +134,19 @@ enable_debug: true             # Enable debugging initially
 
 ### Smart Detection System
 
-The **Smart Detection System** provides intelligent conversation analysis:
+The trigger path is deterministic:
 
-#### 🧠 What It Analyzes
-- **Conversation Complexity**: Technical terms, code blocks, detailed explanations
-- **Message Quality**: Filters out very short messages, focuses on substantial content
-- **Existing Summaries**: Detects previous summaries to avoid redundant processing
-- **Recent Activity**: Weighs recent conversation engagement levels
-- **Question Patterns**: Identifies Q&A sessions and help requests
+#### 🧠 What It Checks
+- **Exact Prompt Tokens**: Calls the provider's `/tokenize` endpoint with the outbound chat payload when configured
+- **Model Capacity**: Uses `max_model_len` returned by `/tokenize` when the provider exposes it
+- **Existing Summaries**: Detects previously injected summary messages to avoid duplication
+- **Conversation Tail**: Preserves the configured number of recent turns after compaction
 
 #### 🔄 How It Works
-- **Complexity Scoring**: Calculates conversation difficulty based on content analysis
-- **Adaptive Thresholds**: Adjusts trigger points based on conversation complexity
-- **Context Preservation**: Maintains important details, numbers, dates, and decisions
-- **Smart Timing**: Uses sophisticated logic to determine optimal summarization moments
+- **Primary Path**: Exact `/tokenize` decides whether the current request is over the configured trigger percentage
+- **Compaction Planning**: Candidate compacted payloads are checked with exact tokenization when available
+- **Fallback Path**: If `/tokenize` is unavailable or fails, summarization falls back to `summary_trigger_turns`
+- **State Replay**: Stored summarized prefixes are reapplied so later requests stay in sync
 
 ### Quality Modes
 
@@ -189,37 +188,39 @@ summary_model: "gpt-3.5-turbo"    # Use cloud model for summarization
 #### 🎛️ Essential Configuration
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `summary_trigger_turns` | `8` | Fallback minimum turns before summarization can occur |
+| `tokenizer_api_base_url` | `""` | Base URL for exact `/tokenize` preflight calls |
+| `tokenizer_api_key` | `""` | Optional API key for `/tokenize` preflight calls |
+| `summary_trigger_turns` | `6` | Fallback minimum turns before summarization when exact tokenization is unavailable |
 | `preserve_recent_turns` | `4` | Minimum number of recent turns to keep unsummarized |
-| `max_context_tokens` | `32768` | Estimated model context window size |
-| `summary_trigger_percent` | `70` | Trigger compaction at this estimated context usage |
-| `summary_target_percent` | `45` | Target this estimated context usage after compaction |
-| `estimated_chars_per_token` | `4.0` | Approximation factor for context estimation |
+| `max_context_tokens` | `32768` | Fallback context limit when `/tokenize` does not return model capacity |
+| `summary_trigger_percent` | `70` | Trigger compaction at this percentage of model capacity |
+| `summary_target_percent` | `45` | Target this percentage of model capacity after compaction |
+| `estimated_chars_per_token` | `4.0` | Diagnostic-only approximation used in debug logging |
 | `summary_model` | `"auto"` | Model for summarization (`"auto"` or specific model name) |
 | `summary_quality` | `"balanced"` | Summary quality: `"quick"`, `"balanced"`, or `"detailed"` |
 | `priority` | `0` | Filter execution priority (lower = higher priority) |
 
-#### 🧠 Intelligence Settings
+#### 🧠 Request Routing Settings
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `smart_detection` | `true` | Enable intelligent conversation analysis |
-| `adaptive_threshold` | `true` | Adjust trigger based on message complexity |
-| `preserve_important_details` | `true` | Extract and preserve numbers, dates, key facts |
-| `include_context_hints` | `true` | Add helpful context hints to summaries |
-| `min_message_length` | `20` | Minimum characters per message to count |
+| `summary_api_base_url` | `""` | Optional Open WebUI base URL override for summary self-calls |
+| `summary_api_key` | `""` | Optional API key for summary self-calls |
+| `summary_api_timeout_seconds` | `60` | Timeout for `/api/chat/completions` and `/tokenize` HTTP calls |
+| `force_summarize_next` | `false` | Force summarization on the next message, then reset |
 
 ### Advanced Options
 
 #### ⚡ Performance Settings
 ```yaml
 enable_caching: true                    # Cache summaries for performance
-enable_ai_summarization: false         # Use model-based summarization with rule-based fallback
-summary_api_base_url: ""               # Optional Open WebUI base URL override for self-calls
-summary_api_key: ""                    # Optional API key override for self-calls
-summary_api_timeout_seconds: 60        # Timeout for /api/chat/completions self-calls
-summary_max_chars_quick: 250           # Hard cap for quick summaries
-summary_max_chars_balanced: 500        # Hard cap for balanced summaries
-summary_max_chars_detailed: 800        # Hard cap for detailed summaries
+summary_api_base_url: ""               # Optional Open WebUI base URL override for summary self-calls
+summary_api_key: ""                    # Optional API key override for summary self-calls
+tokenizer_api_base_url: ""             # Base URL for provider-side exact /tokenize
+tokenizer_api_key: ""                  # Optional API key override for /tokenize
+summary_api_timeout_seconds: 60         # Timeout for both summary and tokenize HTTP calls
+summary_max_chars_quick: 250            # Hard cap for quick summaries
+summary_max_chars_balanced: 500         # Hard cap for balanced summaries
+summary_max_chars_detailed: 800         # Hard cap for detailed summaries
 ```
 
 #### 🔧 Testing & Debug
@@ -233,16 +234,15 @@ force_summarize_next: false           # Force summarization on next message
 
 #### 🚀 Optimization Features
 - **Smart Caching** - Avoids regenerating identical summaries
-- **Adaptive Thresholds** - Complex conversations get summarized sooner
-- **Efficient Processing** - Only processes meaningful messages
-- **Change Detection** - Monitors conversation patterns for optimal timing
+- **Exact Preflight** - Uses provider token counts instead of heuristic trigger decisions
+- **Efficient Compaction** - Preserves only the recent tail needed after summarization
+- **Deterministic Fallback** - Uses a flat turn threshold when exact tokenization is unavailable
 
 #### 📊 Performance Monitoring
 The filter tracks and reports:
 - Cache hit ratios for efficiency measurement
 - Summary creation statistics
-- Processing time for optimization
-- Pattern matching performance
+- Current trigger decisions and summary activity
 
 ---
 
@@ -252,7 +252,7 @@ The filter tracks and reports:
 
 #### 🔄 Automatic Operation
 The filter works transparently:
-1. **Monitors** conversation length and complexity
+1. **Monitors** exact token usage when `/tokenize` is configured
 2. **Triggers** summarization when thresholds are met
 3. **Preserves** recent messages for natural flow
 4. **Creates** intelligent summaries with key context
@@ -262,8 +262,8 @@ The filter works transparently:
 Watch for these indicators:
 ```
 🔍 Summarizer analyzing 12 messages...
-📝 Creating balanced summary using current model (10 turns → summary + 4 recent)
-✅ Ai summary created using current model! 12 → 6 messages
+📝 Creating balanced summary using current model (82410 exact tokens, target 58982)
+✅ AI summary created using current model! 82410 exact tokens -> 40218 exact (target 58982)
 ```
 
 ### Testing & Debugging
@@ -290,9 +290,10 @@ Debug logs show:
 ```
 === CONV_SUMMARIZER DEBUG ===
 [14:30:22] Total messages: 12
-[14:30:22] Conversation analysis - Total: 8, Valid: 7, Complexity: 1.85
+[14:30:22] Conversation analysis - Total: 8, Summaries: 1, Est. tokens: 1432
+[14:30:22] Exact context threshold reached (82410/131072 tokens, trigger 91750)
 [14:30:22] Should summarize: true (smart: true, force: false)
-[14:30:22] Generated enhanced rule-based balanced summary
+[14:30:22] Generated AI summary using qwen3.6-35b
 =============================
 ```
 
@@ -300,14 +301,15 @@ Debug logs show:
 
 #### ⚙️ Fine-Tuning Settings
 - **Lower Trigger**: Reduce `summary_trigger_turns` for shorter conversations
+- **Exact First**: Prefer configuring `tokenizer_api_base_url` instead of relying on fallback turns
 - **Preserve More**: Increase `preserve_recent_turns` for better context
 - **Quality Adjustment**: Use `"detailed"` for technical discussions
 - **Model Selection**: Use lightweight models for summarization
 
 #### 📈 Performance Optimization
 - **Enable Caching**: Keep `enable_caching: true` for repeated patterns
-- **Adaptive Thresholds**: Use `adaptive_threshold: true` for smart timing
-- **Smart Detection**: Keep `smart_detection: true` for best results
+- **Tune Percentages**: Adjust `summary_trigger_percent` and `summary_target_percent` to change compaction aggressiveness
+- **Fallback Only**: Treat `summary_trigger_turns` as a safety net, not your primary trigger
 
 ---
 
@@ -318,7 +320,7 @@ Debug logs show:
 #### 🔄 Conversation Analysis Flow
 ```mermaid
 graph TD
-    A[Message Input] --> B[Smart Detection Analysis]
+   A[Message Input] --> B[Exact Tokenize Preflight]
     B --> C{Should Summarize?}
     C -->|No| D[Pass Through]
     C -->|Yes| E[Check Cache]
@@ -331,13 +333,13 @@ graph TD
     J --> K[Performance Stats]
 ```
 
-#### 🧠 Smart Detection Process
-1. **Message Analysis** - Count valid turns, analyze complexity
-2. **Context Detection** - Check for existing summaries, technical content
-3. **Threshold Calculation** - Apply adaptive logic based on complexity
-4. **Decision Logic** - Determine if summarization should occur
-5. **Summary Generation** - Create quality-appropriate summary
-6. **Context Integration** - Seamlessly integrate into conversation flow
+#### 🧠 Trigger and Compaction Process
+1. **Message Analysis** - Count conversation turns and detect existing summaries
+2. **Exact Preflight** - Query `/tokenize` with the outbound message payload when configured
+3. **Threshold Calculation** - Apply `summary_trigger_percent` and `summary_target_percent`
+4. **Decision Logic** - Fall back to `summary_trigger_turns` only if exact tokenization is unavailable
+5. **Summary Generation** - Create a quality-appropriate summary through the configured summary model
+6. **Context Integration** - Rebuild the message list with a summary plus preserved recent turns
 
 ### Caching System
 
@@ -376,7 +378,7 @@ graph TD
 ```yaml
 # Solutions to try:
 1. Check filter is enabled for your model
-2. Verify summary_trigger_turns setting (default: 8)
+2. Verify tokenizer_api_base_url points at a working /tokenize endpoint
 3. Enable debug mode: enable_debug: true
 4. Test manually: force_summarize_next: true
 5. Check console logs for error messages
@@ -387,9 +389,9 @@ graph TD
 ```yaml
 # Improvements:
 1. Change quality mode: summary_quality: "detailed"
-2. Enable detail preservation: preserve_important_details: true
-3. Increase context: preserve_recent_turns: 6
-4. Use specialized model: summary_model: "specific-model"
+2. Increase context: preserve_recent_turns: 6
+3. Use a stronger summary model: summary_model: "specific-model"
+4. Check the generated summary text in debug logs before tuning thresholds
 ```
 
 #### ❌ Performance Issues
@@ -399,7 +401,7 @@ graph TD
 1. Enable caching: enable_caching: true
 2. Use lightweight model: summary_model: "llama3.2:3b"
 3. Reduce detail level: summary_quality: "quick"
-4. Check debug logs for bottlenecks
+4. If /tokenize is remote, check latency and timeout settings
 ```
 
 ### Debug Mode
@@ -409,15 +411,14 @@ Enable full debugging:
 ```yaml
 enable_debug: true
 test_mode: true
-debug_performance: true  # If available
 ```
 
 #### 📋 Debug Output Interpretation
 ```bash
 # Successful operation
-[14:30:22] Enhanced analysis: {'total_turns': 8, 'complexity_score': 1.85}
+[14:30:22] Enhanced analysis: {'total_turns': 8, 'summary_count': 1, 'estimated_tokens': 1432, 'exact_tokens': 82410, 'max_model_len': 131072}
 [14:30:22] Should summarize: true
-[14:30:22] Generated enhanced rule-based balanced summary
+[14:30:22] Generated AI summary using qwen3.6-35b
 
 # Cache performance
 [14:30:22] Performance stats: {'cache_hits': 5, 'summaries_created': 3}
@@ -437,12 +438,11 @@ debug_performance: true  # If available
 #### 💾 Configuration Recovery
 ```yaml
 # Safe default configuration
-summary_trigger_turns: 8
+tokenizer_api_base_url: "http://your-vllm-host:8000"
+summary_trigger_turns: 6
 preserve_recent_turns: 4
 summary_quality: "balanced"
 summary_model: "auto"
-smart_detection: true
-adaptive_threshold: true
 enable_caching: true
 enable_debug: true
 ```
@@ -468,8 +468,7 @@ Monitor filter performance:
 ```python
 performance_stats = {
     "cache_hits": 15,        # Number of cache hits
-    "summaries_created": 8,   # New summaries generated
-    "hit_ratio": 0.65        # Cache efficiency
+   "summaries_created": 8   # New summaries generated
 }
 ```
 
@@ -484,7 +483,7 @@ performance_stats = {
 ### Future Enhancements
 
 #### 🚀 Planned Features
-- **AI-Based Summarization** - Direct model integration for summarization
+- **Tokenizer Auto-Discovery** - Infer provider tokenize endpoints from model configuration
 - **Custom Prompt Templates** - User-defined summary formats
 - **Multi-Language Support** - International conversation handling
 - **Advanced Analytics** - Detailed conversation insights
@@ -553,7 +552,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 **📝 Enhance your Open WebUI conversations with intelligent summarization!**
 
-*Smart detection • Model selection • Performance optimized • Production ready*
+*Exact token preflight • Model selection • Performance optimized • Production ready*
 
 ---
 
@@ -561,12 +560,11 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 | Setting | Default | Purpose |
 |---------|---------|---------|
-| `summary_trigger_turns` | `8` | When to start summarizing |
+| `tokenizer_api_base_url` | `""` | Exact tokenize endpoint root |
+| `summary_trigger_turns` | `6` | Fallback start point if exact tokenization is unavailable |
 | `preserve_recent_turns` | `4` | Recent messages to keep |
 | `summary_quality` | `"balanced"` | Summary detail level |
 | `summary_model` | `"auto"` | Model for summarization |
-| `smart_detection` | `true` | Intelligent analysis |
-| `adaptive_threshold` | `true` | Dynamic triggering |
 | `enable_debug` | `true` | Debug logging |
 
 </div>

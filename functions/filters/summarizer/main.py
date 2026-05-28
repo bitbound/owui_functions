@@ -26,11 +26,11 @@ class Filter:
         )
         max_context_tokens: int = Field(
             default=32768,
-            description="Estimated maximum context window size for the active model",
+            description="Fallback maximum context window size when exact tokenization does not return model capacity",
         )
         summary_trigger_percent: int = Field(
             default=70,
-            description="Trigger compaction when estimated context usage reaches this percentage",
+            description="Trigger compaction when exact context usage reaches this percentage of model capacity",
         )
         summary_trigger_turns: int = Field(
             default=6,
@@ -38,11 +38,11 @@ class Filter:
         )
         summary_target_percent: int = Field(
             default=45,
-            description="After compaction, target this percentage of estimated context usage",
+            description="After compaction, target this percentage of model capacity",
         )
         estimated_chars_per_token: float = Field(
             default=4.0,
-            description="Approximate characters per token used for context estimation",
+            description="Approximate characters per token used only for diagnostic estimates",
         )
 
         # Model and processing control
@@ -121,7 +121,7 @@ class Filter:
         self.icon = """data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGZpbGw9Im5vbmUiIHZpZXdCb3g9IjAgMCAyNCAyNCIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZT0iY3VycmVudENvbG9yIj4KICA8cGF0aCBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGQ9Ik0zIDEyaDEybTAtNiA0IDQtNC00bTYgNkgxbTAgNi00LTQgNCAxNCIvPgo8L3N2Zz4="""
 
         # State tracking
-        self.conversation_count = 0
+        self.request_count = 0
         self.summary_cache = {}  # Cache summaries to avoid regeneration
         self.conversation_states = {}  # Track conversation analysis
         self.last_summary_turn_counts = {}
@@ -234,7 +234,7 @@ class Filter:
             )
 
     def _estimate_text_tokens(self, text: str) -> int:
-        """Estimate token count from text using a configurable chars/token ratio."""
+        """Estimate token count for diagnostics using a configurable chars/token ratio."""
         if not text:
             return 0
 
@@ -242,26 +242,14 @@ class Filter:
         return max(1, int(len(text) / chars_per_token) + 1)
 
     def _estimate_message_tokens(self, msg: Dict[str, Any]) -> int:
-        """Estimate token count for a single message including a small role overhead."""
+        """Estimate token count for diagnostics including a small role overhead."""
         content = self._safe_get_text_content(msg)
         role = msg.get("role", "")
         return self._estimate_text_tokens(content) + self._estimate_text_tokens(role) + 4
 
     def _estimate_messages_tokens(self, messages: List[Dict]) -> int:
-        """Estimate total token count across messages."""
+        """Estimate total token count across messages for diagnostics."""
         return sum(self._estimate_message_tokens(msg) for msg in messages)
-
-    def _get_context_thresholds(self) -> Dict[str, int]:
-        """Return estimated trigger and target token budgets."""
-        max_tokens = max(self.valves.max_context_tokens, 1)
-        trigger_percent = min(max(self.valves.summary_trigger_percent, 1), 100)
-        target_percent = min(max(self.valves.summary_target_percent, 1), trigger_percent)
-
-        return {
-            "max_tokens": max_tokens,
-            "trigger_tokens": max(1, int(max_tokens * (trigger_percent / 100))),
-            "target_tokens": max(1, int(max_tokens * (target_percent / 100))),
-        }
 
     def _get_summary_char_limit(self, quality: str) -> int:
         """Return the configured max summary length for a quality mode."""
@@ -282,12 +270,23 @@ class Filter:
         self, body: Dict[str, Any], __user__: Optional[dict], model: str
     ) -> str:
         """Build a stable conversation identifier for summary tracking."""
-        chat_id = body.get("chat_id") or body.get("id")
+        chat_id = body.get("chat_id")
         if chat_id:
+            self._debug_log(f"Using chat_id conversation key: {chat_id}")
             return str(chat_id)
 
+        request_id = body.get("id")
+        if request_id:
+            self._debug_log(
+                f"Ignoring request-scoped id for summary state tracking: {request_id}"
+            )
+
         user_id = (__user__ or {}).get("id", "anon")
-        return f"fallback:{user_id}:{model}"
+        fallback_id = f"fallback:{user_id}:{model}"
+        self._debug_log(
+            f"Using fallback conversation key (user/model scoped): {fallback_id}"
+        )
+        return fallback_id
 
     def _hash_messages(self, messages: List[Dict[str, Any]]) -> str:
         """Build a stable hash of message roles and extracted text content."""
@@ -309,6 +308,9 @@ class Filter:
         """Reapply the last stored summary to a full chat payload when possible."""
         state = self.conversation_states.get(conversation_id)
         if not state:
+            self._debug_log(
+                f"No stored summary state for conversation key: {conversation_id}"
+            )
             return messages
 
         if any(msg.get("role") == "system" and "📋 **Conversation Summary**" in self._safe_get_text_content(msg) for msg in messages):
@@ -361,16 +363,6 @@ class Filter:
         )
         return restored_messages
 
-    def _get_effective_context_tokens(
-        self, conversation_id: str, conv_state: Dict[str, Any]
-    ) -> int:
-        """Use the current request's estimated size after any stored summary has been reapplied."""
-        exact_tokens = conv_state.get("exact_tokens")
-        if exact_tokens is not None:
-            return exact_tokens
-
-        return 0
-
     def _clear_summary_state(self, conversation_id: str) -> None:
         """Drop any stored summary baseline for a conversation."""
         self.conversation_states.pop(conversation_id, None)
@@ -392,9 +384,6 @@ class Filter:
     ) -> None:
         """Persist the compacted summary so future full payloads can be restored."""
         self.conversation_states[conversation_id] = {
-            "effective_tokens_after_summary": self._estimate_messages_tokens(
-                new_messages
-            ),
             "valid_turns_at_summary": conv_state.get("valid_turns", 0),
             "summarized_message_count": len(messages_to_summarize),
             "summarized_prefix_hash": self._hash_messages(messages_to_summarize),
@@ -452,6 +441,34 @@ class Filter:
 
         return f"{base_url.rstrip('/')}/tokenize"
 
+    def _normalize_messages_for_tokenizer(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Canonicalize messages for tokenizers that require a single leading system message."""
+        if not messages:
+            return []
+
+        system_messages = [msg for msg in messages if msg.get("role") == "system"]
+        non_system_messages = [msg for msg in messages if msg.get("role") != "system"]
+
+        if not system_messages:
+            return messages
+
+        merged_system_parts = []
+        for msg in system_messages:
+            content = self._safe_get_text_content(msg).strip()
+            if content:
+                merged_system_parts.append(content)
+
+        if not merged_system_parts:
+            return non_system_messages
+
+        merged_system_message = {
+            "role": "system",
+            "content": "\n\n".join(merged_system_parts),
+        }
+        return [merged_system_message, *non_system_messages]
+
     def _build_tokenizer_api_headers(self, __request__) -> Dict[str, str]:
         """Build auth headers for exact tokenizer preflight calls."""
         headers = {
@@ -483,6 +500,8 @@ class Filter:
         messages: List[Dict[str, Any]],
         model: str,
         __request__,
+        context: str = "request",
+        log_errors: bool = True,
     ) -> Optional[Dict[str, int]]:
         """Count prompt tokens using the provider's exact /tokenize endpoint."""
         api_url = self._get_tokenizer_api_url()
@@ -492,7 +511,7 @@ class Filter:
 
         payload = {
             "model": model,
-            "messages": messages,
+            "messages": self._normalize_messages_for_tokenizer(messages),
             "add_generation_prompt": True,
             "add_special_tokens": False,
             "return_token_strs": False,
@@ -505,24 +524,32 @@ class Filter:
                 async with session.post(api_url, json=payload, headers=headers) as response:
                     response_text = await response.text()
                     if response.status >= 400:
-                        self._debug_log(
-                            f"Exact tokenizer failed ({response.status}): {response_text[:200]}"
-                        )
+                        if log_errors:
+                            self._debug_log(
+                                f"Exact tokenizer failed during {context} ({response.status}): {response_text[:200]}"
+                            )
                         return None
 
                     try:
                         response_data = json.loads(response_text)
                     except json.JSONDecodeError:
-                        self._debug_log("Exact tokenizer returned non-JSON response")
+                        if log_errors:
+                            self._debug_log(
+                                f"Exact tokenizer returned non-JSON response during {context}"
+                            )
                         return None
         except Exception as exc:
-            self._debug_log(f"Exact tokenizer request error: {exc}")
+            if log_errors:
+                self._debug_log(f"Exact tokenizer request error during {context}: {exc}")
             return None
 
         count = response_data.get("count")
         max_model_len = response_data.get("max_model_len")
         if not isinstance(count, int) or not isinstance(max_model_len, int):
-            self._debug_log("Exact tokenizer returned unexpected payload shape")
+            if log_errors:
+                self._debug_log(
+                    f"Exact tokenizer returned unexpected payload shape during {context}"
+                )
             return None
 
         return {
@@ -537,11 +564,12 @@ class Filter:
         quality: str,
         source_model: str,
         current_model: str,
+        role: str = "system",
     ) -> Dict[str, Any]:
-        """Build the synthetic summary system message."""
+        """Build the synthetic summary message."""
         model_note = f" via {source_model}" if source_model != current_model else ""
         return {
-            "role": "system",
+            "role": role,
             "content": (
                 f"📋 **Conversation Summary** ({summarized_count} messages, {quality} quality{model_note}):\n\n"
                 f"{summary_text}\n\n---\n*Recent messages continue below*"
@@ -613,6 +641,7 @@ class Filter:
         placeholder_text = "x" * max(self._get_summary_char_limit(quality), 32)
         best_preserve_count = minimum_recent
         used_exact_tokenizer = False
+        planning_fell_back = False
 
         for preserve_count in range(minimum_recent, len(conversation_messages) + 1):
             split_messages = self._split_preserved_tail(
@@ -629,6 +658,7 @@ class Filter:
                 quality,
                 model,
                 model,
+                role="assistant",
             )
             provisional_messages = [
                 *non_summary_system_msgs,
@@ -636,9 +666,13 @@ class Filter:
                 *messages_to_preserve,
             ]
             exact_context = await self._get_exact_token_count(
-                provisional_messages, model, __request__
+                provisional_messages,
+                model,
+                __request__,
+                context="compaction planning",
             )
             if exact_context is None:
+                planning_fell_back = True
                 break
 
             used_exact_tokenizer = True
@@ -658,6 +692,7 @@ class Filter:
             "trigger_tokens": thresholds["trigger_tokens"],
             "preserved_count": len(best_split_messages["messages_to_preserve"]),
             "used_exact_tokenizer": used_exact_tokenizer,
+            "planning_fell_back": planning_fell_back,
         }
 
     def _should_summarize_smart(
@@ -902,25 +937,55 @@ class Filter:
 
         choices = response.get("choices") or []
         if not choices:
+            for key in ("response", "content", "generated_text", "text"):
+                text = self._extract_structured_response_text(response.get(key))
+                if text:
+                    return text
             return None
 
         message = choices[0].get("message") or {}
-        content = message.get("content", "")
+        candidates = [
+            message.get("content"),
+            message.get("text"),
+            choices[0].get("text"),
+            response.get("response"),
+            response.get("content"),
+            response.get("generated_text"),
+            response.get("text"),
+        ]
 
-        if isinstance(content, str):
-            return content.strip() or None
+        for candidate in candidates:
+            text = self._extract_structured_response_text(candidate)
+            if text:
+                return text
 
-        if isinstance(content, list):
+        return None
+
+    def _extract_structured_response_text(self, value: Any) -> Optional[str]:
+        """Extract text from string or structured response content."""
+        if value is None:
+            return None
+
+        if isinstance(value, str):
+            return value.strip() or None
+
+        fragments = self._extract_text_fragments(value)
+        if fragments:
+            joined = " ".join(fragment for fragment in fragments if fragment).strip()
+            return joined or None
+
+        if isinstance(value, dict):
+            for key in ("text", "content", "value"):
+                text = self._extract_structured_response_text(value.get(key))
+                if text:
+                    return text
+
+        if isinstance(value, list):
             parts = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    text = item.get("text", "").strip()
-                    if text:
-                        parts.append(text)
-                elif isinstance(item, str):
-                    text = item.strip()
-                    if text:
-                        parts.append(text)
+            for item in value:
+                text = self._extract_structured_response_text(item)
+                if text:
+                    parts.append(text)
 
             joined = " ".join(parts).strip()
             return joined or None
@@ -1002,16 +1067,15 @@ class Filter:
             body["messages"] = messages
 
             conv_state = self._analyze_conversation_state(messages)
-            exact_context = await self._get_exact_token_count(messages, model, __request__)
+            exact_context = await self._get_exact_token_count(
+                messages, model, __request__, context="incoming request"
+            )
             if exact_context:
                 conv_state["exact_tokens"] = exact_context["count"]
                 conv_state["max_model_len"] = exact_context["max_model_len"]
             else:
                 conv_state["exact_tokens"] = None
                 conv_state["max_model_len"] = None
-            conv_state["effective_tokens"] = self._get_effective_context_tokens(
-                conversation_id, conv_state
-            )
 
             self._debug_log(f"Enhanced analysis: {conv_state}")
 
@@ -1091,14 +1155,18 @@ class Filter:
                     )
 
                     self._debug_log(
-                        f"Summarizing {len(messages_to_summarize)} messages"
+                        f"Summarizing oldest {len(messages_to_summarize)} messages"
                     )
                     self._debug_log(
                         f"Preserving {len(messages_to_preserve)} recent messages"
                     )
-                    if conv_state.get("exact_tokens") is not None:
+                    if split_result.get("used_exact_tokenizer"):
                         self._debug_log(
                             f"Context budget - current {conv_state['exact_tokens']} exact tokens, trigger {split_result['trigger_tokens']}, target {split_result['target_tokens']}, preserved {split_result['preserved_count']} messages"
+                        )
+                    elif conv_state.get("exact_tokens") is not None:
+                        self._debug_log(
+                            f"Compaction planning fell back after tokenizer rejected the provisional compacted payload; current request exact size is {conv_state['exact_tokens']} tokens, preserving {split_result['preserved_count']} messages by fallback"
                         )
                     else:
                         self._debug_log(
@@ -1205,8 +1273,16 @@ class Filter:
                         "cached": "cached",
                     }[summary_source]
                     new_exact_context = await self._get_exact_token_count(
-                        new_messages, model, __request__
+                        new_messages,
+                        model,
+                        __request__,
+                        context="post-summary recount",
+                        log_errors=False,
                     )
+                    if not new_exact_context:
+                        self._debug_log(
+                            "Post-summary exact recount unavailable; using fallback success status"
+                        )
                     if new_exact_context:
                         status_msg = (
                             f"✅ {source_label.capitalize()} summary created using {model_display}! "
@@ -1272,8 +1348,8 @@ class Filter:
                         }
                     )
 
-            self.conversation_count += 1
-            self._debug_log(f"Filter processed conversation #{self.conversation_count}")
+            self.request_count += 1
+            self._debug_log(f"Filter processed request #{self.request_count}")
 
             return body
 
