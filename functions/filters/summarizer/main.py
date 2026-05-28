@@ -14,17 +14,12 @@ import aiohttp
 import json
 import time
 import hashlib
-import inspect
 from uuid import uuid4
 
 
 class Filter:
     class Valves(BaseModel):
         # Core functionality
-        summary_trigger_turns: int = Field(
-            default=8,
-            description="Fallback minimum number of conversation turns before summarization can occur",
-        )
         preserve_recent_turns: int = Field(
             default=4,
             description="Minimum number of recent turns to keep unsummarized during compaction",
@@ -61,23 +56,11 @@ class Filter:
             default="balanced",
             description="Summary quality: 'quick', 'balanced', or 'detailed'",
         )
-        smart_detection: bool = Field(
-            default=True,
-            description="Detect mid-conversation loading and existing summaries",
-        )
-        adaptive_threshold: bool = Field(
-            default=True,
-            description="Adjust trigger based on message complexity and length",
-        )
 
         # Performance optimization
         enable_caching: bool = Field(
             default=True,
             description="Cache summaries to avoid regenerating identical content",
-        )
-        enable_ai_summarization: bool = Field(
-            default=False,
-            description="Use AI model for summarization (experimental - currently uses enhanced rule-based)",
         )
         summary_api_base_url: str = Field(
             default="",
@@ -93,17 +76,6 @@ class Filter:
         )
 
         # Content filtering and enhancement
-        min_message_length: int = Field(
-            default=20,
-            description="Minimum characters per message to count for summarization",
-        )
-        preserve_important_details: bool = Field(
-            default=True,
-            description="Extract and preserve numbers, dates, and key facts",
-        )
-        include_context_hints: bool = Field(
-            default=True, description="Add helpful context hints to summaries"
-        )
         summary_max_chars_quick: int = Field(
             default=250,
             description="Maximum number of characters allowed in quick summaries",
@@ -140,7 +112,6 @@ class Filter:
         self.conversation_count = 0
         self.summary_cache = {}  # Cache summaries to avoid regeneration
         self.conversation_states = {}  # Track conversation analysis
-        self.last_summary_turn_counts = {}  # Track when we last summarized
         self.performance_stats = {"cache_hits": 0, "summaries_created": 0}
 
     def _debug_log(self, message: str):
@@ -294,23 +265,7 @@ class Filter:
         }
 
     def _analyze_conversation_state(self, messages: List[Dict]) -> Dict[str, Any]:
-        """Enhanced conversation analysis with smart detection"""
-
-        if not self.valves.smart_detection:
-            # Fallback to simple counting
-            conv_messages = [
-                m for m in messages if m.get("role") in ["user", "assistant"]
-            ]
-            return {
-                "total_turns": len(conv_messages),
-                "valid_turns": len(conv_messages),
-                "has_existing_summary": False,
-                "summary_count": 0,
-                "complexity_score": 1.0,
-                "avg_message_length": 100,
-                "recent_activity_score": 1.0,
-                "estimated_tokens": self._estimate_messages_tokens(messages),
-            }
+        """Analyze current conversation size and summary presence."""
 
         system_msgs = [m for m in messages if m.get("role") == "system"]
         conv_messages = [m for m in messages if m.get("role") in ["user", "assistant"]]
@@ -326,131 +281,29 @@ class Filter:
             ):
                 existing_summaries += 1
 
-        # Calculate message complexity
-        total_chars = 0
-        complex_messages = 0
-        question_count = 0
-        code_messages = 0
-        technical_messages = 0
-
-        for msg in conv_messages:
-            content = self._safe_get_text_content(msg)
-            if len(content) >= self.valves.min_message_length:
-                total_chars += len(content)
-
-                # Complexity indicators
-                content_lower = content.lower()
-                if any(
-                    word in content_lower
-                    for word in [
-                        "analyze",
-                        "explain",
-                        "complex",
-                        "detailed",
-                        "comprehensive",
-                        "describe",
-                        "elaborate",
-                    ]
-                ):
-                    complex_messages += 1
-                if "?" in content:
-                    question_count += 1
-                if any(
-                    indicator in content
-                    for indicator in [
-                        "```",
-                        "def ",
-                        "function",
-                        "import ",
-                        "class ",
-                        "SELECT",
-                        "UPDATE",
-                        "CREATE",
-                    ]
-                ):
-                    code_messages += 1
-                if any(
-                    term in content_lower
-                    for term in [
-                        "algorithm",
-                        "database",
-                        "api",
-                        "server",
-                        "client",
-                        "protocol",
-                        "framework",
-                    ]
-                ):
-                    technical_messages += 1
-
-        valid_messages = [
-            m
-            for m in conv_messages
-            if len(self._safe_get_text_content(m)) >= self.valves.min_message_length
-        ]
-        avg_length = total_chars / max(len(valid_messages), 1)
-
-        # Calculate complexity score
-        complexity_score = 1.0
-        if len(valid_messages) > 0:
-            complexity_score += (complex_messages / len(valid_messages)) * 0.5
-            complexity_score += (question_count / len(valid_messages)) * 0.3
-            complexity_score += (code_messages / len(valid_messages)) * 0.4
-            complexity_score += (technical_messages / len(valid_messages)) * 0.3
-            complexity_score += min(avg_length / 200, 0.5)  # Length factor
-
-        # Recent activity score (more recent = higher score)
-        recent_activity = 0
-        for msg in conv_messages[-5:]:  # Last 5 messages
-            if len(self._safe_get_text_content(msg)) >= self.valves.min_message_length:
-                recent_activity += 1
-        recent_activity_score = min(recent_activity / 3, 1.0)
+        estimated_tokens = self._estimate_messages_tokens(messages)
 
         self._debug_log(
-            f"Conversation analysis - Total: {len(conv_messages)}, Valid: {len(valid_messages)}, Summaries: {existing_summaries}, Complexity: {complexity_score:.2f}, Activity: {recent_activity_score:.2f}, Est. tokens: {self._estimate_messages_tokens(messages)}"
+            f"Conversation analysis - Total: {len(conv_messages)}, Summaries: {existing_summaries}, Est. tokens: {estimated_tokens}"
         )
 
         return {
             "total_turns": len(conv_messages),
-            "valid_turns": len(valid_messages),
+            "valid_turns": len(conv_messages),
             "has_existing_summary": existing_summaries > 0,
             "summary_count": existing_summaries,
-            "complexity_score": complexity_score,
-            "avg_message_length": avg_length,
-            "recent_activity_score": recent_activity_score,
-            "question_count": question_count,
-            "code_messages": code_messages,
-            "technical_messages": technical_messages,
-            "estimated_tokens": self._estimate_messages_tokens(messages),
+            "estimated_tokens": estimated_tokens,
         }
 
     def _should_summarize_smart(
         self, conv_state: Dict[str, Any], conversation_id: str
     ) -> bool:
-        """Smart decision on whether to summarize"""
-
-        base_threshold = self.valves.summary_trigger_turns
-        current_turns = conv_state["valid_turns"]
+        """Summarize when the effective context estimate reaches the trigger budget."""
         effective_tokens = conv_state.get(
             "effective_tokens", conv_state.get("estimated_tokens", 0)
         )
         thresholds = self._get_context_thresholds()
         trigger_tokens = thresholds["trigger_tokens"]
-
-        # Fallback turn buffer only applies before we have a compacted baseline.
-        if (
-            conversation_id not in self.conversation_states
-            and conversation_id in self.last_summary_turn_counts
-        ):
-            turns_since_last = (
-                current_turns - self.last_summary_turn_counts[conversation_id]
-            )
-            min_buffer_turns = max(1, int(base_threshold * 0.6))
-            if turns_since_last < min_buffer_turns:
-                self._debug_log(
-                    f"Too soon since last summary ({turns_since_last} turns ago, need {min_buffer_turns})"
-                )
-                return False
 
         if effective_tokens >= trigger_tokens:
             self._debug_log(
@@ -458,31 +311,7 @@ class Filter:
             )
             return True
 
-        # Don't summarize if there are existing summaries and not much new content
-        if conv_state["has_existing_summary"] and current_turns < base_threshold * 1.5:
-            self._debug_log(f"Existing summary present, waiting for more content")
-            return False
-
-        # Apply adaptive threshold
-        if self.valves.adaptive_threshold:
-            # Adjust based on complexity and activity
-            complexity_factor = (conv_state["complexity_score"] - 1.0) * 0.3
-            activity_factor = conv_state["recent_activity_score"] * 0.2
-
-            adjusted_threshold = base_threshold * (
-                1 - complexity_factor - activity_factor
-            )
-            adjusted_threshold = max(
-                adjusted_threshold, base_threshold * 0.5
-            )  # Never go below 50%
-
-            self._debug_log(
-                f"Adaptive threshold: {adjusted_threshold:.1f} (base: {base_threshold}, complexity: {complexity_factor:.2f}, activity: {activity_factor:.2f})"
-            )
-
-            return current_turns >= adjusted_threshold
-        else:
-            return current_turns >= base_threshold
+        return False
 
     def _split_messages_by_context_budget(
         self, system_msgs: List[Dict], conversation_messages: List[Dict], quality: str
@@ -538,228 +367,6 @@ class Filter:
             "estimated_preserved_tokens": preserve_tokens,
         }
 
-    def _extract_key_information(self, messages: List[Dict]) -> Dict[str, List[str]]:
-        """Extract key information from messages for enhanced summarization"""
-
-        questions = []
-        technical_terms = []
-        numbers_and_dates = []
-        key_decisions = []
-        topics = []
-
-        for msg in messages:
-            # Use safe content extraction to handle list-based formats
-            content = self._safe_get_text_content(msg)
-            role = msg.get("role", "")
-
-            # Extract questions
-            if "?" in content and role == "user":
-                sentences = content.split("?")
-                for sentence in sentences[:-1]:  # Exclude last empty part
-                    question = sentence.strip()
-                    if len(question) > 10:
-                        questions.append(question[-150:])  # Last 150 chars
-
-            # Extract technical terms and code
-            if any(
-                indicator in content
-                for indicator in [
-                    "```",
-                    "def ",
-                    "function",
-                    "import ",
-                    "class ",
-                    "SELECT",
-                    "CREATE",
-                ]
-            ):
-                if "```" in content:
-                    technical_terms.append("code blocks")
-                if any(
-                    lang in content.lower()
-                    for lang in ["python", "javascript", "sql", "html", "css"]
-                ):
-                    technical_terms.append("programming")
-                if any(
-                    db in content.lower()
-                    for db in ["database", "table", "query", "sql"]
-                ):
-                    technical_terms.append("database")
-
-            # Extract numbers and dates (improved)
-            words = content.split()
-            for word in words:
-                # Numbers
-                if word.replace(",", "").replace(".", "").isdigit() and len(word) <= 6:
-                    numbers_and_dates.append(word)
-                # Dates
-                elif any(
-                    month in word.lower()
-                    for month in [
-                        "jan",
-                        "feb",
-                        "mar",
-                        "apr",
-                        "may",
-                        "jun",
-                        "jul",
-                        "aug",
-                        "sep",
-                        "oct",
-                        "nov",
-                        "dec",
-                    ]
-                ):
-                    numbers_and_dates.append(word)
-                # Years
-                elif word.isdigit() and 1900 <= int(word) <= 2030:
-                    numbers_and_dates.append(word)
-
-            # Look for decision indicators
-            if any(
-                decision_word in content.lower()
-                for decision_word in [
-                    "decided",
-                    "conclusion",
-                    "result",
-                    "solution",
-                    "answer",
-                    "resolved",
-                    "outcome",
-                    "final",
-                ]
-            ):
-                if role == "assistant" and len(content) > 50:
-                    key_decisions.append(content[:200])
-
-            # Extract topics (first few words of user messages)
-            if role == "user" and len(content) > 20:
-                first_words = " ".join(content.split()[:8])
-                if not any(
-                    first_words.lower().startswith(q)
-                    for q in ["what", "how", "can", "could", "would", "please"]
-                ):
-                    topics.append(first_words)
-
-        return {
-            "questions": questions[:5],  # Top 5 questions
-            "technical_terms": list(set(technical_terms))[:5],
-            "numbers_and_dates": list(set(numbers_and_dates))[:8],
-            "key_decisions": key_decisions[:3],
-            "topics": topics[:4],
-        }
-
-    def _create_enhanced_summary(self, messages: List[Dict], quality: str) -> str:
-        """Create enhanced summary based on quality setting"""
-
-        # Extract key information
-        key_info = self._extract_key_information(messages)
-
-        self._debug_log(
-            f"Extracted key info: {len(key_info['questions'])} questions, {len(key_info['technical_terms'])} tech terms, {len(key_info['key_decisions'])} decisions"
-        )
-
-        # Build summary based on quality
-        if quality == "quick":
-            summary_parts = []
-            if key_info["questions"]:
-                summary_parts.append(
-                    f"Discussed {len(key_info['questions'])} main question(s)"
-                )
-            if key_info["technical_terms"]:
-                summary_parts.append(
-                    f"including {', '.join(key_info['technical_terms'][:2])}"
-                )
-            if key_info["key_decisions"]:
-                summary_parts.append("with conclusions reached")
-
-            summary = (
-                ". ".join(summary_parts) if summary_parts else "General discussion"
-            )
-            summary += f". Context from {len(messages)} messages preserved."
-
-        elif quality == "detailed":
-            summary_parts = []
-
-            # Add questions/topics
-            if key_info["questions"]:
-                summary_parts.append(
-                    f"Key questions addressed: {'; '.join(key_info['questions'][:2])}"
-                )
-
-            if key_info["topics"]:
-                summary_parts.append(
-                    f"Topics covered: {'; '.join(key_info['topics'][:3])}"
-                )
-
-            # Add technical context
-            if key_info["technical_terms"]:
-                summary_parts.append(
-                    f"Technical areas: {', '.join(key_info['technical_terms'][:4])}"
-                )
-
-            # Add important numbers/dates
-            if key_info["numbers_and_dates"] and self.valves.preserve_important_details:
-                summary_parts.append(
-                    f"Key details mentioned: {', '.join(key_info['numbers_and_dates'][:5])}"
-                )
-
-            # Add decisions/conclusions
-            if key_info["key_decisions"]:
-                summary_parts.append(
-                    f"Conclusions: {key_info['key_decisions'][0][:150]}..."
-                )
-
-            summary = ". ".join(summary_parts)
-            if not summary:
-                summary = f"Comprehensive discussion across {len(messages)} messages with detailed exchanges"
-
-            if self.valves.include_context_hints:
-                summary += f". Complete context and technical details preserved for seamless continuation."
-
-        else:  # balanced
-            summary_parts = []
-
-            # Balanced approach
-            if key_info["questions"]:
-                summary_parts.append(
-                    f"Main topics: {len(key_info['questions'])} key questions/discussions"
-                )
-                if len(key_info["questions"]) > 0:
-                    summary_parts.append(
-                        f"including '{key_info['questions'][0][:80]}...'"
-                    )
-
-            context_items = []
-            if key_info["technical_terms"]:
-                context_items.append(f"{', '.join(key_info['technical_terms'][:3])}")
-            if key_info["key_decisions"]:
-                context_items.append("solutions provided")
-
-            if context_items:
-                summary_parts.append(f"Covering {', '.join(context_items)}")
-
-            # Add some key details if available
-            if key_info["numbers_and_dates"] and self.valves.preserve_important_details:
-                summary_parts.append(
-                    f"Key details: {', '.join(key_info['numbers_and_dates'][:4])}"
-                )
-
-            summary = ". ".join(summary_parts)
-            if not summary:
-                summary = f"Ongoing conversation with {len(messages)} substantive message exchanges"
-
-            if self.valves.include_context_hints:
-                summary += f". Context preserved for natural continuation."
-
-        summary = self._enforce_summary_length(summary, quality)
-
-        self._debug_log(
-            f"Generated {quality} summary ({len(summary)} chars): {summary[:100]}..."
-        )
-
-        return summary
-
     def _get_cache_key(self, messages: List[Dict]) -> str:
         """Generate cache key for messages"""
         if not self.valves.enable_caching:
@@ -767,7 +374,6 @@ class Filter:
 
         # Create a hash based on message content
         content_string = (
-            f"mode:{'ai' if self.valves.enable_ai_summarization else 'rule'}|"
             f"model:{self.valves.summary_model}|"
             f"quality:{self.valves.summary_quality}|"
         )
@@ -1002,73 +608,15 @@ class Filter:
         summary_model: str,
         quality: str,
         __request__,
-        __user__: Optional[dict] = None,
     ) -> Optional[str]:
-        """Generate a summary, preferring the public chat API and falling back to internal helpers."""
-        if not __request__ or not __user__ or not __user__.get("id"):
-            self._debug_log("AI summarization skipped: missing request or user context")
+        """Generate a summary through the public chat completions API."""
+        if not __request__:
+            self._debug_log("AI summarization skipped: missing request context")
             return None
 
-        summary = await self._create_ai_summary_via_http(
+        return await self._create_ai_summary_via_http(
             messages, summary_model, quality, __request__
         )
-        if summary:
-            return summary
-
-        self._debug_log("Falling back to internal AI summarization path")
-
-        prompt_messages = self._build_ai_summary_messages(messages, quality)
-        if len(prompt_messages) < 2:
-            return None
-
-        try:
-            from open_webui.main import generate_chat_completion
-            from open_webui.models.users import Users
-        except Exception as exc:
-            self._debug_log(f"AI summarization unavailable: {exc}")
-            return None
-
-        user = await Users.get_user_by_id(__user__["id"])
-        if not user:
-            self._debug_log(
-                f"AI summarization skipped: could not load user {__user__['id']}"
-            )
-            return None
-
-        payload = {
-            "model": summary_model,
-            "messages": prompt_messages,
-            "stream": False,
-            "chat_id": f"local:summarizer:{uuid4().hex}",
-            "id": f"summarizer-{uuid4().hex}",
-        }
-
-        self._debug_log(
-            f"Attempting AI summarization with model {summary_model} for {len(messages)} messages"
-        )
-
-        generate_signature = inspect.signature(generate_chat_completion)
-        if "bypass_filter" in generate_signature.parameters:
-            response = await generate_chat_completion(
-                __request__, payload, user, bypass_filter=True
-            )
-        else:
-            self._debug_log(
-                "AI summarization using legacy chat completion signature without bypass_filter"
-            )
-            response = await generate_chat_completion(__request__, payload, user)
-
-        summary = self._extract_ai_summary_text(response)
-
-        if summary:
-            summary = self._enforce_summary_length(summary, quality)
-            self._debug_log(
-                f"AI summarization succeeded ({len(summary)} chars)"
-            )
-        else:
-            self._debug_log("AI summarization returned no usable text")
-
-        return summary
 
     async def inlet(
         self,
@@ -1199,42 +747,25 @@ class Filter:
                         )
 
                     # Create enhanced summary
-                    summary_source = "rule-based"
+                    summary_source = "ai"
                     if cached_summary:
                         summary_text = cached_summary
                         summary_source = "cached"
                         self._debug_log(f"Using cached summary")
                     else:
-                        # Try AI summarization if enabled
-                        summary_text = None
-                        if self.valves.enable_ai_summarization:
-                            try:
-                                summary_text = await self._create_ai_summary(
-                                    summary_input_messages,
-                                    summary_model,
-                                    self.valves.summary_quality,
-                                    __request__,
-                                    __user__,
-                                )
-                                if summary_text:
-                                    summary_source = "ai"
-                                    self._debug_log(
-                                        f"Generated AI summary using {summary_model}"
-                                    )
-                            except Exception as e:
-                                self._debug_log(
-                                    f"AI summarization failed: {str(e)}, falling back to enhanced rule-based"
-                                )
-
-                        # Fall back to enhanced rule-based summarization
+                        summary_text = await self._create_ai_summary(
+                            summary_input_messages,
+                            summary_model,
+                            self.valves.summary_quality,
+                            __request__,
+                        )
                         if not summary_text:
-                            summary_text = self._create_enhanced_summary(
-                                summary_input_messages, self.valves.summary_quality
+                            raise RuntimeError(
+                                "AI summarization failed or returned no usable text"
                             )
-                            summary_source = "rule-based"
-                            self._debug_log(
-                                f"Generated enhanced rule-based {self.valves.summary_quality} summary"
-                            )
+                        self._debug_log(
+                            f"Generated AI summary using {summary_model}"
+                        )
 
                         # Cache the result
                         if cache_key:
@@ -1297,7 +828,6 @@ class Filter:
                     source_label = {
                         "ai": "AI",
                         "cached": "cached",
-                        "rule-based": "rule-based",
                     }[summary_source]
                     new_effective_tokens = self.conversation_states[conversation_id][
                         "effective_tokens_after_summary"
@@ -1340,7 +870,7 @@ class Filter:
                         {
                             "type": "status",
                             "data": {
-                                "description": f"✋ No summarization needed ({conv_state['valid_turns']}/{self.valves.summary_trigger_turns} turns, complexity: {conv_state['complexity_score']:.2f}) | Model: {summary_model}",
+                                "description": f"✋ No summarization needed ({conv_state['effective_tokens']} effective est. tokens, trigger {self._get_context_thresholds()['trigger_tokens']}) | Model: {summary_model}",
                                 "done": True,
                                 "hidden": False,
                             },
