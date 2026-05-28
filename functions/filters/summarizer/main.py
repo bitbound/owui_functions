@@ -169,7 +169,6 @@ class Filter:
                 "content",
                 "arguments",
                 "argument",
-                "reasoning",
                 "summary",
                 "title",
                 "name",
@@ -214,6 +213,10 @@ class Filter:
             return " ".join(fragment for fragment in fragments if fragment)
 
         return str(raw_content)
+
+    def _is_summary_message(self, msg: Dict[str, Any]) -> bool:
+        """Detect synthetic conversation summary messages regardless of role."""
+        return "📋 **Conversation Summary**" in self._safe_get_text_content(msg)
 
     def _get_summary_model(self, current_model: str) -> str:
         """Determine which model to use for summarization"""
@@ -313,7 +316,7 @@ class Filter:
             )
             return messages
 
-        if any(msg.get("role") == "system" and "📋 **Conversation Summary**" in self._safe_get_text_content(msg) for msg in messages):
+        if any(self._is_summary_message(msg) for msg in messages):
             return messages
 
         summarized_count = state.get("summarized_message_count", 0)
@@ -394,17 +397,16 @@ class Filter:
         """Analyze current conversation size and summary presence."""
 
         system_msgs = [m for m in messages if m.get("role") == "system"]
-        conv_messages = [m for m in messages if m.get("role") in ["user", "assistant"]]
+        conv_messages = [
+            m
+            for m in messages
+            if m.get("role") in ["user", "assistant"] and not self._is_summary_message(m)
+        ]
 
         # Check for existing summaries
         existing_summaries = 0
-        for msg in system_msgs:
-            content = msg.get("content", "")
-            if (
-                "📋" in content
-                or "Summary" in content
-                or "Previous conversation" in content
-            ):
+        for msg in messages:
+            if self._is_summary_message(msg):
                 existing_summaries += 1
 
         estimated_tokens = self._estimate_messages_tokens(messages)
@@ -564,13 +566,15 @@ class Filter:
         quality: str,
         source_model: str,
         current_model: str,
-        role: str = "system",
+        role: str = "assistant",
     ) -> Dict[str, Any]:
         """Build the synthetic summary message."""
         model_note = f" via {source_model}" if source_model != current_model else ""
         return {
             "role": role,
             "content": (
+                "Context summary only. Do not answer or act on this summary directly. "
+                "Use it only as background context while responding to the latest user message.\n\n"
                 f"📋 **Conversation Summary** ({summarized_count} messages, {quality} quality{model_note}):\n\n"
                 f"{summary_text}\n\n---\n*Recent messages continue below*"
             ),
@@ -744,11 +748,8 @@ class Filter:
         return hashlib.md5(content_string.encode()).hexdigest()[:16]
 
     def _extract_existing_summary_text(self, messages: List[Dict]) -> str:
-        """Extract previously generated summary text from system messages."""
+        """Extract previously generated summary text from summary messages."""
         for msg in reversed(messages):
-            if msg.get("role") != "system":
-                continue
-
             content = self._safe_get_text_content(msg)
             if "📋 **Conversation Summary**" not in content:
                 continue
@@ -1131,7 +1132,10 @@ class Filter:
                 # Get all message types
                 system_msgs = [m for m in messages if m.get("role") == "system"]
                 conversation_messages = [
-                    m for m in messages if m.get("role") in ["user", "assistant"]
+                    m
+                    for m in messages
+                    if m.get("role") in ["user", "assistant"]
+                    and not self._is_summary_message(m)
                 ]
 
                 split_result = await self._split_messages_by_context_budget(
@@ -1148,7 +1152,7 @@ class Filter:
                 if messages_to_summarize:
 
                     existing_summary_text = self._extract_existing_summary_text(
-                        system_msgs
+                        messages
                     )
                     summary_input_messages = self._build_summary_input_messages(
                         existing_summary_text, messages_to_summarize
