@@ -249,6 +249,50 @@ class Filter:
         user_id = (__user__ or {}).get("id", "anon")
         return f"fallback:{user_id}:{model}"
 
+    def _get_effective_context_tokens(
+        self, conversation_id: str, conv_state: Dict[str, Any]
+    ) -> int:
+        """Estimate effective context size as compacted baseline plus growth since last summary."""
+        full_tokens = conv_state.get("estimated_tokens", 0)
+        valid_turns = conv_state.get("valid_turns", 0)
+        state = self.conversation_states.get(conversation_id)
+
+        if not state:
+            return full_tokens
+
+        full_tokens_at_summary = state.get("full_tokens_at_summary", 0)
+        effective_tokens_after_summary = state.get(
+            "effective_tokens_after_summary", full_tokens_at_summary
+        )
+        valid_turns_at_summary = state.get("valid_turns_at_summary", 0)
+
+        # If history shrank or rewound, the previous baseline is no longer trustworthy.
+        if full_tokens < full_tokens_at_summary or valid_turns < valid_turns_at_summary:
+            self._debug_log(
+                "Conversation state reset: history appears truncated or rewritten"
+            )
+            self.conversation_states.pop(conversation_id, None)
+            return full_tokens
+
+        growth_since_summary = max(0, full_tokens - full_tokens_at_summary)
+        effective_tokens = effective_tokens_after_summary + growth_since_summary
+        return min(effective_tokens, full_tokens)
+
+    def _record_summary_state(
+        self,
+        conversation_id: str,
+        conv_state: Dict[str, Any],
+        new_messages: List[Dict],
+    ) -> None:
+        """Persist the estimated compacted baseline for future trigger decisions."""
+        self.conversation_states[conversation_id] = {
+            "full_tokens_at_summary": conv_state.get("estimated_tokens", 0),
+            "effective_tokens_after_summary": self._estimate_messages_tokens(
+                new_messages
+            ),
+            "valid_turns_at_summary": conv_state.get("valid_turns", 0),
+        }
+
     def _analyze_conversation_state(self, messages: List[Dict]) -> Dict[str, Any]:
         """Enhanced conversation analysis with smart detection"""
 
@@ -387,26 +431,30 @@ class Filter:
 
         base_threshold = self.valves.summary_trigger_turns
         current_turns = conv_state["valid_turns"]
-        estimated_tokens = conv_state.get("estimated_tokens", 0)
+        effective_tokens = conv_state.get(
+            "effective_tokens", conv_state.get("estimated_tokens", 0)
+        )
         thresholds = self._get_context_thresholds()
         trigger_tokens = thresholds["trigger_tokens"]
 
-        # Don't summarize if we just did recently
-        if conversation_id in self.last_summary_turn_counts:
+        # Fallback turn buffer only applies before we have a compacted baseline.
+        if (
+            conversation_id not in self.conversation_states
+            and conversation_id in self.last_summary_turn_counts
+        ):
             turns_since_last = (
                 current_turns - self.last_summary_turn_counts[conversation_id]
             )
-            if estimated_tokens < trigger_tokens and turns_since_last < max(
-                1, int(base_threshold * 0.6)
-            ):
+            min_buffer_turns = max(1, int(base_threshold * 0.6))
+            if turns_since_last < min_buffer_turns:
                 self._debug_log(
-                    f"Too soon since last summary ({turns_since_last} turns ago)"
+                    f"Too soon since last summary ({turns_since_last} turns ago, need {min_buffer_turns})"
                 )
                 return False
 
-        if estimated_tokens >= trigger_tokens:
+        if effective_tokens >= trigger_tokens:
             self._debug_log(
-                f"Context threshold reached ({estimated_tokens}/{thresholds['max_tokens']} est. tokens, trigger {trigger_tokens})"
+                f"Context threshold reached ({effective_tokens}/{thresholds['max_tokens']} effective est. tokens, trigger {trigger_tokens})"
             )
             return True
 
@@ -1071,6 +1119,9 @@ class Filter:
             # Enhanced conversation analysis
             conv_state = self._analyze_conversation_state(messages)
             conversation_id = self._get_conversation_id(body, __user__, model)
+            conv_state["effective_tokens"] = self._get_effective_context_tokens(
+                conversation_id, conv_state
+            )
 
             self._debug_log(f"Enhanced analysis: {conv_state}")
 
@@ -1105,7 +1156,7 @@ class Filter:
                     {
                         "type": "status",
                         "data": {
-                            "description": f"📝 Creating {self.valves.summary_quality} summary using {model_display} ({conv_state['estimated_tokens']} est. tokens, target {self._get_context_thresholds()['target_tokens']})",
+                            "description": f"📝 Creating {self.valves.summary_quality} summary using {model_display} ({conv_state['effective_tokens']} effective est. tokens from {conv_state['estimated_tokens']} full, target {self._get_context_thresholds()['target_tokens']})",
                             "done": False,
                             "hidden": False,
                         },
@@ -1140,7 +1191,7 @@ class Filter:
                         f"Preserving {len(messages_to_preserve)} recent messages"
                     )
                     self._debug_log(
-                        f"Context budget - current {conv_state['estimated_tokens']} est. tokens, trigger {split_result['trigger_tokens']}, target {split_result['target_tokens']}, preserved ~{split_result['estimated_preserved_tokens']}"
+                        f"Context budget - current {conv_state['effective_tokens']} effective est. tokens from {conv_state['estimated_tokens']} full, trigger {split_result['trigger_tokens']}, target {split_result['target_tokens']}, preserved ~{split_result['estimated_preserved_tokens']}"
                     )
                     if existing_summary_text:
                         self._debug_log(
@@ -1232,6 +1283,7 @@ class Filter:
                     body["messages"] = new_messages
 
                     # Update tracking
+                    self._record_summary_state(conversation_id, conv_state, new_messages)
                     self.last_summary_turn_counts[conversation_id] = conv_state[
                         "valid_turns"
                     ]
@@ -1247,7 +1299,10 @@ class Filter:
                         "cached": "cached",
                         "rule-based": "rule-based",
                     }[summary_source]
-                    status_msg = f"✅ {source_label.capitalize()} summary created using {model_display}! {conv_state['estimated_tokens']} est. tokens compacted toward {split_result['target_tokens']}"
+                    new_effective_tokens = self.conversation_states[conversation_id][
+                        "effective_tokens_after_summary"
+                    ]
+                    status_msg = f"✅ {source_label.capitalize()} summary created using {model_display}! {conv_state['estimated_tokens']} full est. tokens -> {new_effective_tokens} effective (target {split_result['target_tokens']})"
 
                     await __event_emitter__(
                         {
