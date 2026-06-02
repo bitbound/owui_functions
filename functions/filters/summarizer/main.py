@@ -1150,7 +1150,6 @@ class Filter:
                 messages_to_preserve = split_result["messages_to_preserve"]
 
                 if messages_to_summarize:
-
                     existing_summary_text = self._extract_existing_summary_text(
                         messages
                     )
@@ -1310,6 +1309,159 @@ class Filter:
                     )
 
                     # Reset force flag
+                    if self.valves.force_summarize_next:
+                        self.valves.force_summarize_next = False
+                        self._debug_log("Reset force_summarize_next flag")
+
+                elif (
+                    conv_state.get("exact_tokens") is not None
+                    and conv_state["exact_tokens"] >= thresholds["trigger_tokens"]
+                ):
+                    # Edge case: over token threshold but split produced no messages
+                    # (e.g. preserve_recent_turns >= conversation message count).
+                    # Preserve up to and including the last user message so the
+                    # downstream agent always has a query to process.
+                    self._debug_log(
+                        f"Over token threshold ({conv_state['exact_tokens']} tokens >= {thresholds['trigger_tokens']} trigger) "
+                        f"but not enough messages to split — preserving last user query"
+                    )
+                    # Find the last user message index; everything after it
+                    # (if any) is also preserved along with the user message.
+                    last_user_idx = -1
+                    for i in range(len(conversation_messages) - 1, -1, -1):
+                        if conversation_messages[i].get("role") == "user":
+                            last_user_idx = i
+                            break
+
+                    if last_user_idx >= 0:
+                        messages_to_summarize = conversation_messages[:last_user_idx]
+                        messages_to_preserve = conversation_messages[last_user_idx:]
+                    else:
+                        # No user message at all — preserve nothing to summarize,
+                        # let the normal path handle it (shouldn't happen, but be safe).
+                        messages_to_summarize = []
+                        messages_to_preserve = conversation_messages
+
+                    # Regenerate cache key for the full conversation
+                    cache_key = self._get_cache_key(conversation_messages)
+                    cached_summary = None
+                    if cache_key and cache_key in self.summary_cache:
+                        cached_summary = self.summary_cache[cache_key]
+                        self.performance_stats["cache_hits"] += 1
+                        self._debug_log(f"Found cached full-conversation summary for key: {cache_key}")
+
+                    existing_summary_text = self._extract_existing_summary_text(messages)
+                    summary_input_messages = self._build_summary_input_messages(
+                        existing_summary_text, messages_to_summarize
+                    )
+
+                    summary_source = "ai"
+                    if cached_summary:
+                        summary_text = cached_summary
+                        summary_source = "cached"
+                        self._debug_log("Using cached full-conversation summary")
+                    else:
+                        summary_text = await self._create_ai_summary(
+                            summary_input_messages,
+                            summary_model,
+                            self.valves.summary_quality,
+                            __request__,
+                        )
+                        if not summary_text:
+                            raise RuntimeError(
+                                "AI summarization failed or returned no usable text"
+                            )
+                        self._debug_log(
+                            f"Generated AI summary using {summary_model}"
+                        )
+                        if cache_key:
+                            self.summary_cache[cache_key] = summary_text
+                            if len(self.summary_cache) > 15:
+                                oldest_key = list(self.summary_cache.keys())[0]
+                                del self.summary_cache[oldest_key]
+
+                        self.performance_stats["summaries_created"] += 1
+
+                    self._debug_log(f"Final summary: {summary_text}")
+
+                    new_messages = []
+                    for sys_msg in system_msgs:
+                        content = sys_msg.get("content", "")
+                        if (
+                            "📋" not in content
+                            and "Summary" not in content
+                            and "Previous conversation" not in content
+                        ):
+                            new_messages.append(sys_msg)
+                            self._debug_log(f"Kept system message: {content[:50]}...")
+
+                    summary_message = self._build_summary_message(
+                        summary_text,
+                        len(messages_to_summarize),
+                        self.valves.summary_quality,
+                        summary_model,
+                        model,
+                    )
+                    new_messages.append(summary_message)
+                    self._debug_log("Added enhanced summary message")
+
+                    body["messages"] = new_messages
+
+                    if self._should_persist_summary_state(conv_state, force_resync):
+                        self._record_summary_state(
+                            conversation_id,
+                            conv_state,
+                            new_messages,
+                            messages_to_summarize,
+                            summary_message,
+                        )
+                        self.last_summary_turn_counts[conversation_id] = conv_state[
+                            "valid_turns"
+                        ]
+                    else:
+                        self._debug_log(
+                            "Summary state not persisted because the request did not include a retained summary"
+                        )
+                        self._clear_summary_state(conversation_id)
+
+                    self._debug_log(
+                        f"Final message count: {len(new_messages)} (was {len(messages)})"
+                    )
+                    self._debug_log(f"Performance stats: {self.performance_stats}")
+
+                    source_label = {
+                        "ai": "AI",
+                        "cached": "cached",
+                    }[summary_source]
+                    new_exact_context = await self._get_exact_token_count(
+                        new_messages,
+                        model,
+                        __request__,
+                        context="post-summary recount",
+                        log_errors=False,
+                    )
+                    if new_exact_context:
+                        status_msg = (
+                            f"✅ {source_label.capitalize()} summary created using {model_display}! "
+                            f"{conv_state.get('exact_tokens', 0)} exact tokens -> {new_exact_context['count']} exact (target {thresholds['target_tokens']})"
+                        )
+                    else:
+                        status_msg = (
+                            f"✅ {source_label.capitalize()} summary created using {model_display}! "
+                            f"fallback: summarized all {len(conversation_messages)} messages"
+                        )
+
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": status_msg,
+                                "done": True,
+                                "hidden": False,
+                            },
+                        }
+                    )
+
                     if self.valves.force_summarize_next:
                         self.valves.force_summarize_next = False
                         self._debug_log("Reset force_summarize_next flag")
