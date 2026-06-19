@@ -70,9 +70,13 @@ class Filter:
             default="",
             description="Optional base URL override for AI summary self-calls (defaults to current Open WebUI request base URL)",
         )
-        tokenizer_api_base_url: str = Field(
+        tokenizer_api_base_urls: str = Field(
             default="",
-            description="Base URL for exact /tokenize preflight calls against the active inference server",
+            description=(
+                'JSON map of conversation model name -> per-model vLLM base URL for exact /tokenize preflight calls, e.g. '
+                '{"Qwen/Qwen3.6-35B-A3B-FP8":"http://192.168.0.15:8000","google/gemma-4-e4b-it":"http://192.168.0.15:8008"}. '
+                "A longest-prefix match is used so tagged variants (e.g. model:latest) resolve to the right server."
+            ),
         )
         summary_api_key: str = Field(
             default="",
@@ -435,12 +439,60 @@ class Filter:
             "target_tokens": max(1, int(max_tokens * (target_percent / 100))),
         }
 
-    def _get_tokenizer_api_url(self) -> Optional[str]:
-        """Resolve the exact tokenizer URL for provider preflight checks."""
-        base_url = (self.valves.tokenizer_api_base_url or "").strip()
-        if not base_url:
+    def _parse_tokenizer_base_urls(self) -> Dict[str, str]:
+        """Parse the per-model tokenizer base URL mapping valve."""
+        raw = (self.valves.tokenizer_api_base_urls or "").strip()
+        if not raw:
+            return {}
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            self._debug_log(f"Failed to parse tokenizer_api_base_urls JSON: {exc}")
+            return {}
+
+        if not isinstance(data, dict):
+            self._debug_log(
+                "tokenizer_api_base_urls must be a JSON object of model -> url"
+            )
+            return {}
+
+        mapping: Dict[str, str] = {}
+        for key, value in data.items():
+            url = str(value).strip()
+            if url:
+                mapping[str(key)] = url
+        return mapping
+
+    def _get_tokenizer_api_url(self, model: str) -> Optional[str]:
+        """Resolve the exact tokenizer URL for the given conversation model."""
+        mapping = self._parse_tokenizer_base_urls()
+        if not mapping:
+            self._debug_log(
+                "Exact tokenizer skipped: tokenizer_api_base_urls is not configured"
+            )
             return None
 
+        base_url = mapping.get(model)
+        match_reason = "exact"
+        if base_url is None:
+            best_prefix = ""
+            for prefix, url in mapping.items():
+                if model.startswith(prefix) and len(prefix) > len(best_prefix):
+                    best_prefix = prefix
+                    base_url = url
+            if base_url is not None:
+                match_reason = f"prefix:{best_prefix}"
+
+        if not base_url:
+            self._debug_log(
+                f"No tokenizer base URL mapped for model: {model}"
+            )
+            return None
+
+        self._debug_log(
+            f"Resolved tokenizer URL for model {model} ({match_reason}): {base_url.rstrip('/')}/tokenize"
+        )
         return f"{base_url.rstrip('/')}/tokenize"
 
     def _normalize_messages_for_tokenizer(
@@ -506,9 +558,8 @@ class Filter:
         log_errors: bool = True,
     ) -> Optional[Dict[str, int]]:
         """Count prompt tokens using the provider's exact /tokenize endpoint."""
-        api_url = self._get_tokenizer_api_url()
+        api_url = self._get_tokenizer_api_url(model)
         if not api_url:
-            self._debug_log("Exact tokenizer skipped: tokenizer_api_base_url is not configured")
             return None
 
         payload = {
@@ -627,7 +678,7 @@ class Filter:
                 "used_exact_tokenizer": False,
             }
 
-        exact_tokenizer_available = self._get_tokenizer_api_url() is not None
+        exact_tokenizer_available = self._get_tokenizer_api_url(model) is not None
         if not exact_tokenizer_available:
             preserve_count = minimum_recent
             split_messages = self._split_preserved_tail(
